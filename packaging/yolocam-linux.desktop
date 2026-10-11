@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=YoloCam Linux
+Comment=Camera controls, live preview and firmware updates for YoloCam S3
+Exec=yolocam-linux
+Icon=yolocam-linux
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=camera;webcam;YoloLiv;YoloCam;firmware;OBS;
+StartupNotify=true
+StartupWMClass=yolocam-linux

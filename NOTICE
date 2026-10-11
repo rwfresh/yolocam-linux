@@ -1,0 +1,25 @@
+YoloCam Linux
+Copyright (C) 2026 YoloCam Linux contributors
+
+This project is a Rust port and extension of the community YoloCam S3 Linux
+Tools by Seth Hillbrand, Copyright (C) 2026 Seth Hillbrand, licensed under the
+GNU General Public License version 3 or later.
+
+Upstream: https://gitlab.com/yolocam-linux/yolocam-linux
+Protocol/library reference revision: f1cae5198fc4e709bc1a57b771974e333df27928
+
+The protocol schema and control behavior were adapted from that project,
+including local corrections verified against the YoloCam S3 firmware.
+The native firmware updater and new firmware controls were first implemented
+locally in the Python tools and are ported into this application.
+
+The application contains no proprietary YoloLiv Compose binaries, camera
+firmware images, device backups, captured camera pictures, or account secrets.
+Official firmware packages are fetched from the manufacturer's service on
+request and stay in the user's local cache.
+
+YoloLiv and YoloCam are trademarks of their respective owners. This is an
+independent community application and is not an official YoloLiv product.
+
+Third-party Rust dependencies retain their own licenses; see Cargo.lock and
+THIRD_PARTY_NOTICES.md in source and binary distributions.

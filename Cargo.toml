@@ -1,0 +1,45 @@
+[package]
+name = "yolocam-linux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Native Linux controls, preview and firmware updates for YoloLiv YoloCam S3"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rwfresh/yolocam-linux"
+readme = "README.md"
+categories = ["hardware-support", "multimedia::video"]
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+sha2 = "0.10"
+md-5 = "0.10"
+flate2 = "1"
+tar = "0.4"
+dirs = "6"
+clap = { version = "4", features = ["derive", "env"] }
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rscam = { version = "0.5.5", features = ["no_wrapper"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+fs2 = "0.4"
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[[bin]]
+name = "yolocam-linux"
+path = "src/main.rs"

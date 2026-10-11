@@ -1,0 +1,13 @@
+/target/
+/dist/
+*.part
+*.tar.gz
+*.deb
+*.AppImage
+/.local-validation/
+/.hardware-results/
+/.env
+__pycache__/
+*.pyc
+*.log
+*camera-backup*.json

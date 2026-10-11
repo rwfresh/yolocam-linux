@@ -1,0 +1,210 @@
+{
+  "format": 1,
+  "retrieved": "2026-10-11",
+  "notices": [
+    {
+      "file": "LICENSE-egui-MIT.txt",
+      "packages": [
+        "ecolor 0.33.3",
+        "eframe 0.33.3",
+        "egui 0.33.3",
+        "egui-wgpu 0.33.3",
+        "egui-winit 0.33.3",
+        "egui_glow 0.33.3",
+        "emath 0.33.3",
+        "epaint 0.33.3",
+        "epaint_default_fonts 0.33.3"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/LICENSE-MIT"
+      ],
+      "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c",
+      "description": "Complete upstream MIT license, including copyright."
+    },
+    {
+      "file": "LICENSE-egui-APACHE.txt",
+      "packages": [
+        "ecolor 0.33.3",
+        "eframe 0.33.3",
+        "egui 0.33.3",
+        "egui-wgpu 0.33.3",
+        "egui-winit 0.33.3",
+        "egui_glow 0.33.3",
+        "emath 0.33.3",
+        "epaint 0.33.3",
+        "epaint_default_fonts 0.33.3"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/LICENSE-APACHE"
+      ],
+      "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90",
+      "description": "Complete upstream Apache-2.0 alternative."
+    },
+    {
+      "file": "LICENSE-profiling-MIT.txt",
+      "packages": [
+        "profiling 1.0.18"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+      ],
+      "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333",
+      "description": "Complete upstream MIT license, including copyright."
+    },
+    {
+      "file": "LICENSE-profiling-APACHE.txt",
+      "packages": [
+        "profiling 1.0.18"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE"
+      ],
+      "sha256": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551",
+      "description": "Complete upstream Apache-2.0 alternative."
+    },
+    {
+      "file": "LICENSE-gl-rs-APACHE.txt",
+      "packages": [
+        "gl_generator 0.14.0",
+        "khronos_api 3.1.0"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE",
+        "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE"
+      ],
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "description": "Complete upstream Apache-2.0 license, identical at both locked crate commits."
+    },
+    {
+      "file": "LICENSE-protoc-bin-vendored-MIT.txt",
+      "packages": [
+        "protoc-bin-vendored 3.3.0",
+        "protoc-bin-vendored-linux-aarch_64 3.3.0",
+        "protoc-bin-vendored-linux-ppcle_64 3.3.0",
+        "protoc-bin-vendored-linux-s390_64 3.3.0",
+        "protoc-bin-vendored-linux-x86_32 3.3.0",
+        "protoc-bin-vendored-linux-x86_64 3.3.0",
+        "protoc-bin-vendored-macos-aarch_64 3.3.0",
+        "protoc-bin-vendored-macos-x86_64 3.3.0",
+        "protoc-bin-vendored-win32 3.3.0"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/stepancheg/rust-protoc-bin-vendored/d7cc7356ead5b0efd14c415103406b2221a3f8fb/LICENSE.txt"
+      ],
+      "sha256": "97647e63047ef75a82ee2928b335df94f45c87e08777dc033393c73294f3a57a",
+      "description": "Rust build-tool wrapper MIT license; protoc executable has a separate Protobuf license."
+    },
+    {
+      "file": "LICENSE-protobuf-BSD.txt",
+      "packages": [
+        "protoc-bin-vendored 3.3.0",
+        "protoc-bin-vendored-linux-aarch_64 3.3.0",
+        "protoc-bin-vendored-linux-ppcle_64 3.3.0",
+        "protoc-bin-vendored-linux-s390_64 3.3.0",
+        "protoc-bin-vendored-linux-x86_32 3.3.0",
+        "protoc-bin-vendored-linux-x86_64 3.3.0",
+        "protoc-bin-vendored-macos-aarch_64 3.3.0",
+        "protoc-bin-vendored-macos-x86_64 3.3.0",
+        "protoc-bin-vendored-win32 3.3.0"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/protocolbuffers/protobuf/v36.2/LICENSE"
+      ],
+      "sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d",
+      "description": "Protobuf v36.2 build-tool license; protoc is not shipped in the application release."
+    },
+    {
+      "file": "LICENSE-epaint-font-Hack.txt",
+      "packages": [
+        "epaint_default_fonts 0.33.3"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/crates/epaint_default_fonts/fonts/Hack-Regular.txt"
+      ],
+      "sha256": "47c0cccbeec7e8614548cc485588b28149e7874188df5f41b36efebcee285c87",
+      "description": "Exact font license from locked crate and official upstream."
+    },
+    {
+      "file": "LICENSE-epaint-font-Noto-OFL.txt",
+      "packages": [
+        "epaint_default_fonts 0.33.3"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/crates/epaint_default_fonts/fonts/OFL.txt"
+      ],
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+      "description": "Exact font license from locked crate and official upstream."
+    },
+    {
+      "file": "LICENSE-epaint-font-Ubuntu-UFL.txt",
+      "packages": [
+        "epaint_default_fonts 0.33.3"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/crates/epaint_default_fonts/fonts/UFL.txt"
+      ],
+      "sha256": "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002",
+      "description": "Exact font license from locked crate and official upstream."
+    },
+    {
+      "file": "LICENSE-epaint-font-emoji-icon-MIT.txt",
+      "packages": [
+        "epaint_default_fonts 0.33.3"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/crates/epaint_default_fonts/fonts/emoji-icon-font-mit-license.txt"
+      ],
+      "sha256": "b9d2c1d909aa149996fd4c91dcb92b2362a04431640c1d200959da94caf8cde1",
+      "description": "Exact font license from locked crate and official upstream."
+    },
+    {
+      "file": "NOTICE-gl-rs.txt",
+      "packages": [
+        "gl_generator 0.14.0",
+        "khronos_api 3.1.0"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/gl_generator/lib.rs",
+        "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/gl_generator/registry/mod.rs",
+        "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/khronos_api/src/lib.rs"
+      ],
+      "sha256": "654bc2bbbf1bf071665f57f292808922347d6c91d8aec114d9b98505261eafe4",
+      "description": "Verbatim source-file copyright and Apache-2.0 headers from locked upstream revisions."
+    },
+    {
+      "file": "LICENSE-Khronos-EGL-Registry-MIT.txt",
+      "packages": [
+        "khronos_api 3.1.0"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/KhronosGroup/EGL-Registry/b6b558e7042d67fc7543383bb0e13a075f21d8ab/api/egl.xml"
+      ],
+      "sha256": "88fbd63b322a59e067ffd71a8dc42e7efcaa675151eb95b5e2cf8eca290a6c90",
+      "description": "Verbatim registry copyright/license header used to generate Linux graphics bindings."
+    },
+    {
+      "file": "NOTICE-Khronos-OpenGL-Registry.txt",
+      "packages": [
+        "khronos_api 3.1.0"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/85d924a5165e7206f4c73c8c10307658dc2bbe10/xml/glx.xml"
+      ],
+      "sha256": "9dc5622b5bf690aed053b8689d8fdde9e738b8601b2fb6595f4759a890a871af",
+      "description": "Verbatim registry copyright/license header used to generate Linux graphics bindings."
+    },
+    {
+      "file": "NOTICE-epaint-font-copyrights.txt",
+      "packages": [
+        "epaint_default_fonts 0.33.3"
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/crates/epaint_default_fonts/fonts/Hack-Regular.ttf",
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/crates/epaint_default_fonts/fonts/NotoEmoji-Regular.ttf",
+        "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/crates/epaint_default_fonts/fonts/Ubuntu-Light.ttf"
+      ],
+      "sha256": "6213399d5de470b9ddd183556bd64b12587dbcb91ea27636307bb1a2eb94b8f1",
+      "description": "Exact OpenType nameID0 copyright and nameID7 trademark statements from bundled fonts; font files themselves are not copied here."
+    }
+  ]
+}
