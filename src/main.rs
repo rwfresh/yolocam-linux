@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 use yolocam_linux::{
-    camera::{Camera, Crop, param_specs},
+    camera::{Camera, Crop, param_specs, unsupported_control_reason},
     discovery, firmware, gui,
     preview::{Preview, PreviewFrame},
     settings,
@@ -43,7 +43,7 @@ enum Command {
     Diagnose,
     /// Read the camera's version and supported controls.
     Status,
-    /// Read a control, in the same units used by the GUI.
+    /// Read a control in native units (exposure-ev: 0..16, neutral 8).
     Get { parameter: String },
     /// Set a control and verify readback where the camera supports it.
     Set {
@@ -145,8 +145,12 @@ fn run() -> Result<()> {
     let args = Args::parse();
     match args.command {
         Some(Command::Diagnose) => return print_json(discovery::diagnostics()),
-        Some(Command::Controls) => return print_json(param_specs().iter().map(|p|
-            json!({"key":p.key,"label":p.label,"section":p.section,"minimum":p.min,"maximum":p.max,"options":p.options,"unit":p.unit,"readback":p.readback})).collect::<Vec<_>>()),
+        Some(Command::Controls) => return print_json(param_specs().iter().map(|p| {
+            let unsupported_reason = unsupported_control_reason(p.key);
+            json!({"key":p.key,"label":p.label,"section":p.section,"minimum":p.min,"maximum":p.max,"options":p.options,"unit":p.unit,
+                "readback":p.readback && unsupported_reason.is_none(),"supported":unsupported_reason.is_none(),"unsupported_reason":unsupported_reason,
+                "display_offset":if p.key == "exposure-ev" { -8 } else { 0 }})
+        }).collect::<Vec<_>>()),
         Some(Command::Demo) => return gui::run_demo(),
         _ => {}
     }

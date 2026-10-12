@@ -9,6 +9,7 @@ been tested, and its firmware updater accepts only the S3 `ch131b` model.
 | Webcam video | Standard Linux UVC/V4L2 | Native MJPEG preview; OBS/video calls capture directly |
 | USB control link | Standard CDC NCM | USB DHCP address discovered automatically |
 | Image/exposure/WB/focus | Vendor TCP protobuf | Readable settings verified; write-only face region uses explicit acknowledgement |
+| Exposure compensation | Command 15 | Auto exposure, unlocked; native 0…16, neutral 8; GUI displays −8…+8 |
 | HDR | Command 98 | Added in S3 1.0.4 |
 | Native crop | Command 117 | Replaces command 13 from S3 0.0.8 onward |
 | Crop presets A–D | Command 127 | Four positions stored in camera |
@@ -18,9 +19,18 @@ been tested, and its firmware updater accepts only the S3 `ch131b` model.
 | LUT grading | Commands 94–96 | 5,508 packed 30-bit entries, no byte-RGB substitution |
 | Firmware updates | Commands 2/3/28 | Verified package upload, final-packet commit, reboot verification |
 
-The firmware can acknowledge dehaze/shadow/highlight commands without performing
-image processing. They are not working S3 controls in firmware 1.0.4 and are
-excluded. Rejected controls, including legacy global hue/gamma, are disabled.
+S3 firmware 1.0.4 acknowledges the legacy brightness command (7) without changing
+the image, and its getter does not supply a meaningful current value. The app
+does not send or expose that command as a working slider. Use exposure
+compensation to brighten or darken the actual camera output in unlocked Auto
+exposure, or ISO/shutter in Manual exposure. The compensation scale's steps are
+not photographic stops. The vendor desktop app's colour-grading brightness is
+a separate LUT transformation; a LUT brightness editor is not implemented here.
+
+The firmware also acknowledges dehaze/shadow/highlight commands without
+performing image processing. They are excluded. Rejected controls, including
+legacy global hue/gamma, are disabled. Unsupported values in older local
+presets are omitted with a visible notice while usable settings are retained.
 
 Sharpness uses the native negative-value encoding (`-1..-10` becomes `61..70`).
 S3 firmware 0.0.8 onward supports -10 through 10 rather than the older range

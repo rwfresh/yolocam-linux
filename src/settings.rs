@@ -11,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::camera::{CameraState, Crop, HslState, param_specs};
+use crate::camera::{CameraState, Crop, HslState, param_specs, unsupported_control_reason};
 
 pub const APP_DIRECTORY: &str = "yolocam-linux";
 
@@ -63,7 +63,8 @@ impl Preset {
         let mut values = BTreeMap::new();
         let mut omitted_controls = BTreeMap::new();
         for spec in param_specs() {
-            if !spec.readback
+            if unsupported_control_reason(spec.key).is_some()
+                || !spec.readback
                 || state.unsupported.contains_key(spec.key)
                 || (spec.key == "focus-manual" && state.values.get("focus-mode") != Some(&2))
                 || (["exposure-iso", "exposure-time", "exposure-aperture"].contains(&spec.key)
@@ -124,6 +125,48 @@ impl Preset {
         })
     }
 
+    /// v0.1.0 presets included controls that the camera acknowledged without
+    /// changing its image. Keep the usable settings and a visible migration
+    /// note; never reinterpret a legacy brightness value as exposure steps.
+    pub fn normalize(&mut self) {
+        let omitted = &mut self.omitted_controls;
+        self.values.retain(|key, _| {
+            if let Some(reason) = unsupported_control_reason(key) {
+                omitted.insert(key.clone(), reason.to_owned());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub fn normalized(&self) -> Self {
+        let mut preset = self.clone();
+        preset.normalize();
+        preset
+    }
+
+    pub fn from_json(bytes: &[u8]) -> Result<Self> {
+        let mut preset: Self = serde_json::from_slice(bytes)?;
+        preset.normalize();
+        preset.validate()?;
+        Ok(preset)
+    }
+
+    pub fn omission_note(&self) -> Option<String> {
+        if self.omitted_controls.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Skipped unavailable controls: {}",
+            self.omitted_controls
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.name)?;
         if self.schema_version != 1 {
@@ -133,6 +176,9 @@ impl Preset {
             );
         }
         for (key, value) in &self.values {
+            if unsupported_control_reason(key).is_some() {
+                continue;
+            }
             let spec = param_specs()
                 .iter()
                 .find(|spec| spec.key == key)
@@ -221,16 +267,16 @@ impl Store {
     }
 
     pub fn save_preset(&self, preset: &Preset) -> Result<()> {
+        let preset = preset.normalized();
         preset.validate()?;
-        atomic_json(&self.preset_path(&preset.name)?, preset)
+        atomic_json(&self.preset_path(&preset.name)?, &preset)
     }
 
     pub fn load_preset(&self, name: &str) -> Result<Preset> {
         let path = self.preset_path(name)?;
-        let preset: Preset = serde_json::from_slice(
+        let preset = Preset::from_json(
             &fs::read(&path).with_context(|| format!("Cannot read {}", path.display()))?,
         )?;
-        preset.validate()?;
         Ok(preset)
     }
 
@@ -242,10 +288,7 @@ impl Store {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let preset: Preset = serde_json::from_slice(&fs::read(&path)?)
-                .with_context(|| format!("Invalid preset {}", path.display()))?;
-            preset
-                .validate()
+            let preset = Preset::from_json(&fs::read(&path)?)
                 .with_context(|| format!("Invalid preset {}", path.display()))?;
             presets.push(preset);
         }
@@ -348,6 +391,7 @@ mod tests {
     fn capture_keeps_only_real_values_and_manual_focus_in_manual_mode() {
         let mut state = CameraState::default();
         state.values.insert("contrast".to_owned(), 42);
+        state.values.insert("brightness".to_owned(), 50);
         state.values.insert("focus-mode".to_owned(), 4);
         state.values.insert("focus-manual".to_owned(), 67);
         state.values.insert("dehaze".to_owned(), 10);
@@ -358,6 +402,7 @@ mod tests {
             .insert("hue".to_owned(), "Unavailable".to_owned());
         let preset = Preset::capture("Office", &state).unwrap();
         assert_eq!(preset.values.get("contrast"), Some(&42));
+        assert!(!preset.values.contains_key("brightness"));
         assert!(!preset.values.contains_key("dehaze"));
         assert!(!preset.values.contains_key("hue"));
         assert!(!preset.values.contains_key("face-roi"));
@@ -369,6 +414,54 @@ mod tests {
                 .values
                 .get("focus-manual"),
             Some(&67)
+        );
+    }
+
+    #[test]
+    fn legacy_presets_load_import_and_save_without_sending_or_reinterpreting_brightness() {
+        let bytes = br#"{"schema_version":1,"name":"Legacy look","values":{"brightness":50,"hue":50,"gamma":50,"contrast":42,"exposure-mode":0,"exposure-ev":12,"exposure-lock":1},"crop":null,"hsl":null,"profile":null,"wb_offsets":null}"#;
+        let imported = Preset::from_json(bytes).unwrap();
+        assert_eq!(imported.schema_version, 1);
+        assert_eq!(imported.values.get("contrast"), Some(&42));
+        assert_eq!(imported.values.get("exposure-ev"), Some(&12));
+        for key in ["brightness", "hue", "gamma"] {
+            assert!(!imported.values.contains_key(key));
+            assert!(imported.omitted_controls.contains_key(key));
+        }
+        assert!(imported.omission_note().unwrap().contains("brightness"));
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().to_owned()).unwrap();
+        let path = store.preset_path("Legacy look").unwrap();
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            !store
+                .load_preset("Legacy look")
+                .unwrap()
+                .values
+                .contains_key("brightness")
+        );
+        assert!(
+            !store.presets().unwrap()[0]
+                .values
+                .contains_key("brightness")
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "Loading does not overwrite the original preset"
+        );
+        let legacy: Preset = serde_json::from_slice(bytes).unwrap();
+        store.save_preset(&legacy).unwrap();
+        let saved: Preset = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(!saved.values.contains_key("brightness"));
+        assert_eq!(saved.values.get("exposure-ev"), Some(&12));
+        let mut brightness_only = legacy;
+        brightness_only.values.clear();
+        brightness_only.values.insert("brightness".to_owned(), 100);
+        brightness_only.normalize();
+        assert!(
+            brightness_only.values.is_empty(),
+            "Legacy brightness is never rerouted to exposure compensation"
         );
     }
 

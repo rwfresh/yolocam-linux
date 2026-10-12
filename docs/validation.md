@@ -1,10 +1,10 @@
-# Initial release validation
+# Release validation
 
 Validated on 2026-10-11 with an x86-64 Ubuntu 24.04 laptop and a USB-connected
 YoloCam S3 running firmware 1.0.4, build 1349. This is one physical S3 device;
 other camera models are not covered by these results.
 
-## Automated checks
+## v0.1.0 automated checks
 
 `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`
 and all **65 tests** passed. Tests cover the native wire format, bounded TCP
@@ -19,7 +19,7 @@ All five desktop pages rendered successfully using the native Wayland backend.
 The interface also opened and rendered using X11. Demo screenshots contain
 sample data. The installed desktop launcher passed desktop-file validation.
 
-## Physical camera
+## v0.1.0 physical camera
 
 The optimized Rust build captured **2,169 frames over 75.02 seconds** at 1280×720.
 The final measured frame rate was **30.32 fps**. Preview remained active during
@@ -60,3 +60,46 @@ previously updated this S3 successfully.
 
 Private serial numbers, settings backups, captured images and local hardware
 result files are not part of the published repository or release packages.
+
+## v0.1.1 brightness correction
+
+Validated on 2026-10-12 with the same S3 on firmware 1.0.4/build 1349.
+Formatting, Clippy with warnings denied, all **76 tests**, and the release build
+passed. Added tests cover native compensation writes, fresh mode/lock guards,
+signed GUI presentation, no writes when rendering, legacy preset migration,
+locked preset order/timing and restoration on both early and later failures.
+
+The legacy brightness command (7) acknowledges changes but does not process
+the image. Multiple requests including 0, 39 and 100 returned the same
+meaningless readback. The app now excludes it, preserves other values from
+older presets, and exposes working exposure compensation prominently.
+
+Actual captured video was measured across two repetitions of compensation
+8 → 0 → 16, with Auto exposure temporarily unlocked:
+
+| Native compensation | GUI steps | Mean captured luminance, first / second run |
+|---|---|---|
+| 8 | 0 (neutral) | 139.61 / 138.77 |
+| 0 | −8 | 58.68 / 59.58 |
+| 16 | +8 | 167.96 / 165.82 |
+
+The average dark-to-bright change was **107.76** on the 0…255 luminance scale.
+Preview remained live at approximately **30 fps** throughout. Original
+compensation and exposure lock were restored, and no images were saved.
+These measurements demonstrate a change to the camera output, not an app-only
+preview adjustment. No firmware was flashed for this correction.
+
+With a three-second interval before relocking, native compensation 0 and 16
+also produced different captured luminance while locked: **64.66** and **169.29**.
+The preset path keeps exposure unlocked through its other changes, allows that
+bounded settling interval, then restores the saved or original lock. This was
+validated on one camera and scene; it is not a guarantee of AE convergence in
+every lighting condition. The tests restored the original compensation/lock.
+
+The optimized final app worker also exercised legacy presets on the physical
+camera: unsupported brightness was omitted, native EV was applied while
+unlocked, and the lock was restored after settling. Captured luminance changed
+from **70.83** to **169.16**, with approximately **30 fps** capture. A direct EV
+write while locked was rejected with an unlock instruction, and a direct
+legacy brightness write was rejected without the misleading readback error.
+The original compensation and lock were restored.

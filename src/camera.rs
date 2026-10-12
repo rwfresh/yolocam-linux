@@ -223,6 +223,19 @@ pub struct ParamSpec {
     pub readback: bool,
 }
 
+/// Retain legacy specifications for preset migration, but never use commands
+/// that acknowledge changes without processing the image on tested S3 firmware.
+pub fn unsupported_control_reason(key: &str) -> Option<&'static str> {
+    match key {
+        "brightness" => Some(
+            "Legacy brightness is not functional on S3 firmware 1.0.4; use exposure compensation in Auto mode",
+        ),
+        "hue" => Some("Global hue is not functional on S3; use HSL"),
+        "gamma" => Some("Gamma is not functional on S3"),
+        _ => None,
+    }
+}
+
 pub fn param_specs() -> &'static [ParamSpec] {
     macro_rules! param {
         ($key:literal, $label:literal, $section:literal, $cid:literal, $min:literal, $max:literal) => {
@@ -254,7 +267,10 @@ pub fn param_specs() -> &'static [ParamSpec] {
     }
     const SWITCH: &[(i32, &str)] = &[(0, "Off"), (1, "On")];
     static SPECS: &[ParamSpec] = &[
-        param!("brightness", "Brightness", "Image", 7, 0, 100),
+        // Command 7 is a success-returning firmware stub. Its old range is
+        // retained only so presets from 0.1.0 can be migrated without data loss.
+        param!("brightness", "Legacy brightness", "Unsupported", 7, 0, 100),
+        param!("exposure-ev", "Exposure compensation", "Image", 15, 0, 16),
         param!("contrast", "Contrast", "Image", 9, 0, 100),
         param!("saturation", "Saturation", "Image", 10, 0, 100),
         param!("sharpness", "Sharpness", "Image", 8, -10, 10),
@@ -270,14 +286,6 @@ pub fn param_specs() -> &'static [ParamSpec] {
             1,
             &[(0, "Auto"), (1, "Manual")],
             ""
-        ),
-        param!(
-            "exposure-ev",
-            "Exposure compensation",
-            "Exposure",
-            15,
-            0,
-            16
         ),
         param!(
             "anti-flicker",
@@ -674,13 +682,13 @@ impl Camera {
             version: Some(version),
             ..Default::default()
         };
-        self.state.unsupported.insert(
-            "hue".into(),
-            "Global hue is not functional on S3; use HSL".into(),
-        );
-        self.state
-            .unsupported
-            .insert("gamma".into(), "Gamma is not functional on S3".into());
+        for spec in param_specs() {
+            if let Some(reason) = unsupported_control_reason(spec.key) {
+                self.state
+                    .unsupported
+                    .insert(spec.key.into(), reason.into());
+            }
+        }
         for name in ["dehaze", "shadows", "highlights"] {
             self.state.unsupported.insert(
                 name.into(),
@@ -813,10 +821,9 @@ impl Camera {
             spec.readback,
             "{key} is write-only; the camera does not report its current value"
         );
-        ensure!(
-            !matches!(key, "hue" | "gamma"),
-            "{key} is not functional on the S3"
-        );
+        if let Some(reason) = unsupported_control_reason(key) {
+            bail!("{reason}");
+        }
         if self.uses_eptz() && matches!(key, "zoom" | "zoom-speed") {
             bail!("use native ePTZ on this firmware");
         }
@@ -841,13 +848,12 @@ impl Camera {
             .iter()
             .find(|spec| spec.key == key)
             .context("unknown camera parameter")?;
+        if let Some(reason) = unsupported_control_reason(key) {
+            bail!("{reason}");
+        }
         if let Some(reason) = self.state.unsupported.get(key) {
             bail!("{key} is unavailable: {reason}");
         }
-        ensure!(
-            !matches!(key, "hue" | "gamma"),
-            "{key} is not functional on the S3"
-        );
         let maximum = if key == "sharpness" && !self.uses_eptz() {
             30
         } else {
@@ -862,6 +868,18 @@ impl Camera {
             spec.options.is_empty() || spec.options.iter().any(|(number, _)| *number == value),
             "{value} is not a supported choice for {key}"
         );
+        if key == "exposure-ev" {
+            // Check the device rather than trusting a cached GUI state. The
+            // firmware accepts ineffective EV writes in Manual or locked Auto.
+            ensure!(
+                self.get_param("exposure-mode")? == 0,
+                "Exposure compensation requires Auto exposure; use ISO and shutter in Manual mode"
+            );
+            ensure!(
+                self.get_param("exposure-lock")? == 0,
+                "Unlock Auto exposure before changing exposure compensation"
+            );
+        }
         let wire_value = if key == "sharpness" && value < 0 {
             (60 - value) as u32
         } else {
@@ -1151,6 +1169,108 @@ fn body(message: pb::Message) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn legacy_brightness_cannot_read_or_write_a_misleading_firmware_value() {
+        let mut camera = Camera::new(None, 12345, Duration::from_secs(1));
+        for error in [
+            camera.get_param("brightness").unwrap_err(),
+            camera.set_param("brightness", 39).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("exposure compensation"));
+        }
+        assert!(!camera.client.is_connected());
+        assert!(!camera.state.values.contains_key("brightness"));
+    }
+
+    #[test]
+    fn exposure_compensation_checks_actual_mode_and_lock_before_writing() {
+        for (mode, lock) in [(1, 0), (0, 1), (0, 0)] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let peer = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut requests = Vec::new();
+                let mut compensation = 8;
+                loop {
+                    let mut header = [0; 8];
+                    if stream.read_exact(&mut header).is_err() {
+                        break;
+                    }
+                    let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+                    assert!(length <= crate::protocol::MAX_PAYLOAD_SIZE + 8);
+                    let mut frame = header.to_vec();
+                    frame.resize(8 + length, 0);
+                    stream.read_exact(&mut frame[8..]).unwrap();
+                    let request = pb::Message::decode(
+                        crate::protocol::unpack_frame(&frame).unwrap().as_slice(),
+                    )
+                    .unwrap();
+                    requests.push((request.r#type, request.id));
+                    let value = match (request.r#type, request.id) {
+                        (2, 215) => 1,
+                        (1, 14) => mode,
+                        (1, 106) => lock,
+                        (2, 15) => {
+                            let Value::IntVal(value) = request.body.unwrap().value.unwrap() else {
+                                panic!("exposure command must contain its native integer value");
+                            };
+                            compensation = value;
+                            value
+                        }
+                        (1, 15) => compensation,
+                        command => panic!("Unexpected camera request {command:?}"),
+                    };
+                    let response = pb::Message {
+                        r#type: 4,
+                        seq: request.seq,
+                        id: request.id,
+                        resp_code: 200,
+                        body: Some(pb::CommandBody {
+                            value: Some(Value::IntVal(value)),
+                        }),
+                        ..Default::default()
+                    };
+                    stream
+                        .write_all(&crate::protocol::pack_frame(&response.encode_to_vec()))
+                        .unwrap();
+                }
+                requests
+            });
+            let mut camera = Camera::new(Some(Ipv4Addr::LOCALHOST), port, Duration::from_secs(1));
+            camera.client.connect().unwrap();
+            // Stale UI state must not override the actual mode/lock on camera.
+            camera.state.values.insert("exposure-mode".into(), 0);
+            camera.state.values.insert("exposure-lock".into(), 0);
+            assert!(camera.get_param("brightness").is_err());
+            assert!(camera.set_param("brightness", 39).is_err());
+            let result = camera.set_param("exposure-ev", 12);
+            let expected = match (mode, lock) {
+                (1, _) => {
+                    assert!(result.unwrap_err().to_string().contains("Auto exposure"));
+                    vec![(2, 215), (1, 14)]
+                }
+                (0, 1) => {
+                    assert!(result.unwrap_err().to_string().contains("Unlock"));
+                    vec![(2, 215), (1, 14), (1, 106)]
+                }
+                _ => {
+                    assert_eq!(result.unwrap(), 12);
+                    vec![(2, 215), (1, 14), (1, 106), (2, 15), (1, 15)]
+                }
+            };
+            camera.disconnect();
+            assert_eq!(peer.join().unwrap(), expected);
+        }
+    }
+
     #[test]
     fn firmware_version_selects_native_crop_and_sharpness_range() {
         assert!(

@@ -51,6 +51,14 @@ The app serializes control traffic, coalesces slider drags, sends heartbeats and
 recovers broken sockets. Another instance of this app or CLI cannot take over
 its control connection.
 
+**Image brightness:** use **Image → Exposure compensation** in Auto exposure.
+The slider displays −8…+8 camera steps, with 0 neutral. Click **Unlock exposure**
+beside it if exposure is locked; Manual mode uses ISO and shutter instead.
+These steps are the camera's compensation scale, not photographic stops.
+The legacy 0–100 brightness command does nothing on S3 firmware 1.0.4, so it
+is excluded. Existing presets keep their working controls and show an omission
+notice for legacy brightness; its old value is never converted to exposure.
+
 **Live preview:** press `Ctrl+P` to start or pause it. Pause the app's preview
 before OBS or a video-call app opens the same capture device. Camera controls
 continue to work while preview is paused. Video is decoded directly from V4L2
@@ -90,7 +98,7 @@ page. Video calls use the normal webcam entry. The separate vendor controls
 do not appear as new V4L2 sliders in GUVCView or cameractrls.
 
 The S3 supports several shared protocol commands only as stored placeholders
-or rejects them. Dehaze, shadows, highlights, legacy global hue/gamma and
+or rejects them. Legacy brightness, dehaze, shadows, highlights, global hue/gamma and
 unsupported storage/lighting features are not presented as working controls.
 See [hardware support](docs/hardware-support.md).
 
@@ -104,6 +112,7 @@ yolocam-linux status
 yolocam-linux controls
 yolocam-linux get contrast
 yolocam-linux set contrast 55
+yolocam-linux get exposure-ev
 yolocam-linux crop --zoom 2
 yolocam-linux crop --save 0
 yolocam-linux crop --recall 0
@@ -120,6 +129,12 @@ yolocam-linux firmware install --yes
 Close the desktop app before starting a separate CLI control session. The
 session lock prevents these clients from competing for the camera. `diagnose`
 and `controls` can run while the GUI is open because they do not connect.
+
+The CLI and presets retain native `exposure-ev` values **0…16**, where **8**
+is neutral; the GUI subtracts 8 for its display. For example, after selecting
+Auto exposure and unlocking it, `yolocam-linux set exposure-ev 8` selects neutral
+compensation. EV writes check the actual camera mode and lock before sending.
+`controls` identifies known unsupported commands explicitly.
 
 ## Build and test
 
@@ -155,7 +170,7 @@ actual preview pixels and readbacks, and restores those values. It stores no
 images and does not flash firmware. JSON results can be saved with `--output`.
 
 Use `yolocam-linux demo` to inspect the interface without touching a camera.
-See [initial release validation](docs/validation.md) for the physical S3 results
+See [release validation](docs/validation.md) for the physical S3 results
 and the firmware flashing validation limits.
 
 ## Data and development

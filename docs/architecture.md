@@ -10,6 +10,12 @@ Capabilities come from version/read responses. Firmware-aware crop replaces
 legacy zoom, HSL uses the native 24-field structure, and profiles use ID/style/
 HDR-bank fields. This layer is shared by the CLI and GUI.
 
+Known nonfunctional brightness/hue/gamma commands are rejected before I/O;
+their legacy specifications remain only for preset migration. Exposure
+compensation uses native 0…16 (neutral 8); the GUI displays the equivalent
+−8…+8 scale. Every EV write checks fresh camera mode and exposure-lock readbacks.
+The GUI offers explicit mode/unlock actions and never changes those on startup.
+
 `worker` owns the GUI's one camera connection. Pending slider values are
 coalesced by key; individual HSL axes/colours remain independent. Heartbeats and
 control changes are serialized. Presets and firmware installation are barriers
@@ -31,6 +37,11 @@ verification, without another upload.
 tree. `gui` renders the native egui desktop app; it does no socket I/O. The
 binary's advisory session lock prevents multiple app/CLI processes from taking
 over the same camera control connection. Diagnosis/listing/demo need no lock.
+Presets normalize legacy unsupported controls into omission notices. Auto
+exposure compensation is restored while unlocked, followed by the other preset
+settings and a bounded settling interval before locking. A partial preset
+preserves the original lock when it does not specify one. Failures restore that
+lock without replaying the compensation write.
 
 Linux `uvcvideo` and `cdc_ncm` continue to handle the device. The app uses their
 existing interfaces; it does not change network configuration or install a

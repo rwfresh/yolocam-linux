@@ -633,6 +633,14 @@ fn run_worker(
                     }
                     _ => "Camera confirmed the requested value",
                 };
+                let message = if let Command::ApplyPreset(preset) = &command {
+                    match preset.normalized().omission_note() {
+                        Some(note) => format!("{message}. {note}"),
+                        None => message.to_owned(),
+                    }
+                } else {
+                    message.to_owned()
+                };
                 status(&events, message, false);
             }
             Err(error) => {
@@ -651,7 +659,17 @@ fn run_worker(
 }
 
 fn apply_preset(camera: &mut Camera, preset: &Preset, events: &Sender<Event>) -> Result<()> {
+    let preset = preset.normalized();
     preset.validate()?;
+    if preset.values.contains_key("exposure-ev")
+        && preset
+            .values
+            .get("exposure-mode")
+            .or_else(|| camera.state.values.get("exposure-mode"))
+            != Some(&0)
+    {
+        bail!("Preset exposure compensation requires Auto exposure mode");
+    }
     // Set the controlling modes first, then their dependent values. Applying a
     // preset is deliberate and stops at the first rejected or failed write.
     for key in ["hdr", "exposure-mode", "wb-mode", "focus-mode"] {
@@ -670,8 +688,99 @@ fn apply_preset(camera: &mut Camera, preset: &Preset, events: &Sender<Event>) ->
             )?;
         }
     }
+    // Lock snapshots the current AE shutter/gain, rather than the compensation
+    // target. Keep exposure unlocked through the whole preset, then let AE
+    // settle before taking the final lock snapshot. Partial presets restore
+    // the original lock when they did not request a persistent lock change.
+    let original_lock = if preset.values.contains_key("exposure-ev")
+        || preset.values.contains_key("exposure-lock")
+    {
+        Some(camera.get_param("exposure-lock")?)
+    } else {
+        None
+    };
+    let desired_lock = preset
+        .values
+        .get("exposure-lock")
+        .copied()
+        .or(original_lock);
+    let mut lock_change_requested = false;
+    let result: Result<()> = (|| {
+        if preset.values.contains_key("exposure-ev")
+            && original_lock.is_some_and(|value| value != 0)
+        {
+            // Record the cleanup obligation before writing: a lost ACK can
+            // still mean that the unlock reached the camera.
+            lock_change_requested = true;
+            write_exposure_lock(camera, 0, events)?;
+        }
+        apply_preset_values(camera, &preset, events)?;
+        if let Some(value) = desired_lock
+            && camera.state.values.get("exposure-lock") != Some(&value)
+        {
+            lock_change_requested = true;
+            write_exposure_lock(camera, value, events)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if lock_change_requested && let Some(value) = original_lock {
+            status(events, "Restoring the original exposure lock", false);
+            if let Err(restore) = write_exposure_lock(camera, value, events) {
+                return Err(error.context(format!(
+                    "Could not restore the original exposure lock: {restore:#}"
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_exposure_lock(camera: &mut Camera, value: i32, events: &Sender<Event>) -> Result<()> {
+    if value == 1 {
+        status(
+            events,
+            "Waiting for Auto exposure to settle before locking",
+            false,
+        );
+        thread::sleep(Duration::from_secs(3));
+    }
+    perform_absolute(
+        camera,
+        &Command::SetParam {
+            key: "exposure-lock".to_owned(),
+            value,
+        },
+    )
+}
+
+fn apply_preset_values(camera: &mut Camera, preset: &Preset, events: &Sender<Event>) -> Result<()> {
+    if let Some(value) = preset.values.get("exposure-ev") {
+        status(
+            events,
+            format!("Applying preset {}: exposure compensation", preset.name),
+            false,
+        );
+        perform_absolute(
+            camera,
+            &Command::SetParam {
+                key: "exposure-ev".to_owned(),
+                value: *value,
+            },
+        )?;
+    }
     for (key, value) in &preset.values {
-        if ["hdr", "exposure-mode", "wb-mode", "focus-mode"].contains(&key.as_str()) {
+        if [
+            "hdr",
+            "exposure-mode",
+            "wb-mode",
+            "focus-mode",
+            "exposure-ev",
+            "exposure-lock",
+        ]
+        .contains(&key.as_str())
+        {
             continue;
         }
         if key == "focus-manual" && camera.state.values.get("focus-mode") != Some(&2) {
@@ -767,7 +876,345 @@ mod tests {
     use prost::Message as _;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
+
+    type ExposureRequests = Vec<(i32, i32, Option<u32>, Instant)>;
+
+    struct ExposureFixture {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        values: Arc<Mutex<BTreeMap<i32, u32>>>,
+        requests: Arc<Mutex<ExposureRequests>>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl ExposureFixture {
+        fn new(rejected_control: Option<i32>, reject_relock: bool) -> Self {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let values = Arc::new(Mutex::new(BTreeMap::from([
+                (14, 0),
+                (15, 16),
+                (106, 1),
+                (9, 48),
+            ])));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_stop = Arc::clone(&stop);
+            let thread_values = Arc::clone(&values);
+            let thread_requests = Arc::clone(&requests);
+            let thread = thread::spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(8)))
+                                .unwrap();
+                            let _ = serve_exposure(
+                                &mut stream,
+                                &thread_stop,
+                                &thread_values,
+                                &thread_requests,
+                                rejected_control,
+                                reject_relock,
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                port,
+                stop,
+                values,
+                requests,
+                thread: Some(thread),
+            }
+        }
+
+        fn camera(&self) -> Camera {
+            let mut camera =
+                Camera::new(Some(Ipv4Addr::LOCALHOST), self.port, Duration::from_secs(2));
+            camera.client.connect().unwrap();
+            camera.version().unwrap();
+            for key in ["exposure-mode", "exposure-ev", "exposure-lock", "contrast"] {
+                camera.get_param(key).unwrap();
+            }
+            camera
+        }
+
+        fn writes(&self) -> Vec<(i32, u32)> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(kind, cid, value, _)| {
+                    if *kind == 2 && *cid != 215 {
+                        value.map(|value| (*cid, value))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+
+        fn assert_no_legacy_brightness_requests(&self) {
+            assert!(
+                !self
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, cid, _, _)| *cid == 7)
+            );
+        }
+
+        fn assert_settled_final_lock(&self) {
+            let requests = self.requests.lock().unwrap();
+            let writes: Vec<_> = requests
+                .iter()
+                .filter(|(kind, cid, _, _)| *kind == 2 && *cid != 215)
+                .collect();
+            let (_, cid, value, locked_at) = writes.last().unwrap();
+            assert_eq!((*cid, *value), (106, Some(1)));
+            let (_, _, _, last_control_at) = writes
+                .iter()
+                .rev()
+                .find(|(_, cid, _, _)| *cid != 106)
+                .unwrap();
+            assert!(locked_at.duration_since(*last_control_at) >= Duration::from_secs(3));
+        }
+    }
+
+    impl Drop for ExposureFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    fn serve_exposure(
+        stream: &mut TcpStream,
+        stop: &AtomicBool,
+        values: &Mutex<BTreeMap<i32, u32>>,
+        requests: &Mutex<ExposureRequests>,
+        rejected_control: Option<i32>,
+        reject_relock: bool,
+    ) -> Result<()> {
+        use crate::pb::{self, command_body::Value};
+        while !stop.load(Ordering::Acquire) {
+            let mut header = [0; 8];
+            stream.read_exact(&mut header)?;
+            let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            if length > crate::protocol::MAX_PAYLOAD_SIZE + 8 {
+                bail!("invalid request");
+            }
+            let mut frame = header.to_vec();
+            frame.resize(8 + length, 0);
+            stream.read_exact(&mut frame[8..])?;
+            let request = pb::Message::decode(crate::protocol::unpack_frame(&frame)?.as_slice())?;
+            let raw = request.body.and_then(|body| body.value).and_then(|value| {
+                if let Value::IntVal(value) = value {
+                    Some(value)
+                } else {
+                    None
+                }
+            });
+            requests
+                .lock()
+                .unwrap()
+                .push((request.r#type, request.id, raw, Instant::now()));
+            let mut response = pb::Message {
+                r#type: 4,
+                seq: request.seq,
+                id: request.id,
+                resp_code: 100,
+                ..Default::default()
+            };
+            let body = match (request.r#type, request.id, raw) {
+                (2, 215, _) => Some(Value::IntVal(1)),
+                (1, 1, _) => Some(Value::VersionInfo(pb::VersionInfo {
+                    sys_version: "YunxiCamera-ch131b-1.0.4".to_owned(),
+                    sys_code: "1349".to_owned(),
+                    serial_num: "PRESET-TEST".to_owned(),
+                    ..Default::default()
+                })),
+                (1, cid, _) => values.lock().unwrap().get(&cid).copied().map(Value::IntVal),
+                (2, cid, Some(_)) if Some(cid) == rejected_control => {
+                    response.resp_code = 410;
+                    None
+                }
+                (2, 106, Some(1)) if reject_relock => {
+                    response.resp_code = 411;
+                    None
+                }
+                (2, cid, Some(value)) => {
+                    let mut values = values.lock().unwrap();
+                    if cid == 15 && (values.get(&14) != Some(&0) || values.get(&106) != Some(&0)) {
+                        None
+                    } else {
+                        values.insert(cid, value);
+                        Some(Value::IntVal(value))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(value) = body {
+                response.resp_code = 200;
+                response.body = Some(pb::CommandBody { value: Some(value) });
+            }
+            stream.write_all(&crate::protocol::pack_frame(&response.encode_to_vec()))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_locked_and_partial_presets_restore_compensation_then_lock_without_cid7() {
+        for include_lock in [true, false] {
+            let fixture = ExposureFixture::new(None, false);
+            let mut camera = fixture.camera();
+            let mut preset = Preset::capture("Legacy", &camera.state).unwrap();
+            preset.values.insert("brightness".to_owned(), 50);
+            preset.values.insert("exposure-ev".to_owned(), 12);
+            preset.values.insert("contrast".to_owned(), 55);
+            if !include_lock {
+                preset.values.remove("exposure-lock");
+                preset.values.remove("exposure-mode");
+            }
+            let (events, received) = mpsc::channel();
+            apply_preset(&mut camera, &preset, &events).unwrap();
+            let writes = fixture.writes();
+            let exposure_writes: Vec<_> = writes
+                .iter()
+                .copied()
+                .filter(|(cid, _)| [15, 106].contains(cid))
+                .collect();
+            assert_eq!(exposure_writes, vec![(106, 0), (15, 12), (106, 1)]);
+            assert!(
+                writes.contains(&(9, 55)),
+                "Other preset settings remain applicable"
+            );
+            fixture.assert_settled_final_lock();
+            assert!(received.try_iter().any(|event| matches!(event,
+                Event::Status { message, error: false }
+                if message == "Waiting for Auto exposure to settle before locking"
+            )));
+            assert_eq!(fixture.values.lock().unwrap().get(&15), Some(&12));
+            assert_eq!(fixture.values.lock().unwrap().get(&106), Some(&1));
+            fixture.assert_no_legacy_brightness_requests();
+            assert!(
+                preset
+                    .normalized()
+                    .omission_note()
+                    .unwrap()
+                    .contains("brightness")
+            );
+            camera.disconnect();
+        }
+    }
+
+    #[test]
+    fn rejected_compensation_restores_prior_lock_without_retry_and_reports_cleanup_failures() {
+        for reject_relock in [false, true] {
+            let fixture = ExposureFixture::new(Some(15), reject_relock);
+            let mut camera = fixture.camera();
+            let mut preset = Preset::capture("Partial", &camera.state).unwrap();
+            preset.values.clear();
+            preset.values.insert("exposure-ev".to_owned(), 12);
+            let (events, _) = mpsc::channel();
+            let error = apply_preset(&mut camera, &preset, &events).unwrap_err();
+            assert_eq!(fixture.writes(), vec![(106, 0), (15, 12), (106, 1)]);
+            assert_eq!(fixture.values.lock().unwrap().get(&15), Some(&16));
+            if reject_relock {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("410") && message.contains("411"),
+                    "{message}"
+                );
+            } else {
+                assert_eq!(fixture.values.lock().unwrap().get(&106), Some(&1));
+            }
+            fixture.assert_no_legacy_brightness_requests();
+            camera.disconnect();
+        }
+    }
+
+    #[test]
+    fn later_preset_failure_restores_the_original_lock_after_settling_without_replaying_ev() {
+        for reject_relock in [false, true] {
+            let fixture = ExposureFixture::new(Some(9), reject_relock);
+            let mut camera = fixture.camera();
+            let mut preset = Preset::capture("Partial", &camera.state).unwrap();
+            preset.values.clear();
+            preset.values.insert("exposure-ev".to_owned(), 12);
+            preset.values.insert("contrast".to_owned(), 55);
+            let (events, _) = mpsc::channel();
+            let error = apply_preset(&mut camera, &preset, &events).unwrap_err();
+            assert_eq!(
+                fixture.writes(),
+                vec![(106, 0), (15, 12), (9, 55), (106, 1)]
+            );
+            fixture.assert_settled_final_lock();
+            assert_eq!(fixture.values.lock().unwrap().get(&15), Some(&12));
+            assert_eq!(fixture.values.lock().unwrap().get(&9), Some(&48));
+            if reject_relock {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("410") && message.contains("411"),
+                    "{message}"
+                );
+            } else {
+                assert_eq!(fixture.values.lock().unwrap().get(&106), Some(&1));
+            }
+            fixture.assert_no_legacy_brightness_requests();
+            camera.disconnect();
+        }
+    }
+
+    #[test]
+    fn preset_without_compensation_preserves_an_existing_lock_without_unlocking() {
+        let fixture = ExposureFixture::new(None, false);
+        let mut camera = fixture.camera();
+        let mut preset = Preset::capture("Locked colour", &camera.state).unwrap();
+        preset.values.clear();
+        preset.values.insert("brightness".to_owned(), 39);
+        preset.values.insert("contrast".to_owned(), 55);
+        preset.values.insert("exposure-lock".to_owned(), 1);
+        let (events, _) = mpsc::channel();
+        apply_preset(&mut camera, &preset, &events).unwrap();
+        assert_eq!(fixture.writes(), vec![(9, 55)]);
+        assert_eq!(fixture.values.lock().unwrap().get(&106), Some(&1));
+        assert_eq!(fixture.values.lock().unwrap().get(&15), Some(&16));
+        fixture.assert_no_legacy_brightness_requests();
+        camera.disconnect();
+    }
+
+    #[test]
+    fn unlocked_preset_does_not_wait_or_add_an_unrequested_exposure_lock() {
+        let fixture = ExposureFixture::new(None, false);
+        let mut camera = fixture.camera();
+        let mut preset = Preset::capture("Unlocked", &camera.state).unwrap();
+        preset.values.clear();
+        preset.values.insert("exposure-ev".to_owned(), 12);
+        preset.values.insert("contrast".to_owned(), 55);
+        preset.values.insert("exposure-lock".to_owned(), 0);
+        let (events, received) = mpsc::channel();
+        apply_preset(&mut camera, &preset, &events).unwrap();
+        assert_eq!(fixture.writes(), vec![(106, 0), (15, 12), (9, 55)]);
+        assert!(!received.try_iter().any(|event| matches!(event,
+            Event::Status { message, .. }
+            if message == "Waiting for Auto exposure to settle before locking"
+        )));
+        assert_eq!(fixture.values.lock().unwrap().get(&106), Some(&0));
+        camera.disconnect();
+    }
 
     struct FakeCamera {
         port: u16,

@@ -6,7 +6,10 @@ use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextureHandle, Vec2}
 use std::{collections::BTreeMap, net::Ipv4Addr, path::PathBuf, time::Duration};
 
 use crate::{
-    camera::{CameraState, CameraVersion, Crop, HslState, ParamSpec, param_specs},
+    camera::{
+        CameraState, CameraVersion, Crop, HslState, ParamSpec, param_specs,
+        unsupported_control_reason,
+    },
     firmware::FirmwareRelease,
     preview::Preview,
     settings::{Preset, Settings, Store},
@@ -445,20 +448,10 @@ impl App {
                 Event::PresetCaptured(preset) => match self.store.save_preset(&preset) {
                     Ok(()) => {
                         self.selected_preset = Some(preset.name.clone());
-                        self.status = if preset.omitted_controls.is_empty() {
-                            format!("Saved preset {} from camera readbacks", preset.name)
-                        } else {
-                            format!(
-                                "Saved preset {}; omitted out-of-range controls: {}",
-                                preset.name,
-                                preset
-                                    .omitted_controls
-                                    .keys()
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        };
+                        self.status = preset_status(
+                            &format!("Saved preset {} from camera readbacks", preset.name),
+                            &preset,
+                        );
                         self.status_error = false;
                         self.reload_presets();
                     }
@@ -736,7 +729,19 @@ impl App {
                     });
                 }
             });
-            if spec.options.is_empty() {
+            if spec.key == "exposure-ev" {
+                let mut step = exposure_display(value);
+                let response = ui.add(
+                    egui::Slider::new(&mut step, -8..=8)
+                        .integer()
+                        .clamping(egui::SliderClamping::Edits)
+                        .custom_formatter(|value, _| format_exposure_step(value as i32)),
+                );
+                if response.changed() {
+                    value = exposure_wire(step);
+                    changed = true;
+                }
+            } else if spec.options.is_empty() {
                 let mut slider = egui::Slider::new(&mut value, spec.min..=maximum)
                     .integer()
                     .clamping(egui::SliderClamping::Edits)
@@ -748,7 +753,37 @@ impl App {
             }
         })
         .response
-        .on_hover_text(reason.unwrap_or_default());
+        .on_hover_text(reason.clone().unwrap_or_default());
+        if spec.key == "exposure-ev" {
+            ui.label(
+                RichText::new("Camera brightness in Auto exposure. −8…+8 steps; 0 is neutral.")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+            if let Some(reason) = reason {
+                ui.label(RichText::new(reason).size(11.0).color(AMBER));
+            }
+            if self.connected && !self.busy {
+                let action = match (
+                    self.state.values.get("exposure-mode"),
+                    self.state.values.get("exposure-lock"),
+                ) {
+                    (Some(0), Some(1)) => Some(("Unlock exposure", "exposure-lock")),
+                    (Some(1), _) => Some(("Use Auto exposure", "exposure-mode")),
+                    _ => None,
+                };
+                if let Some((label, key)) = action
+                    && ui.button(label).clicked()
+                    && self.send(Command::SetParam {
+                        key: key.to_owned(),
+                        value: 0,
+                    })
+                    && !self.demo
+                {
+                    self.desired.insert(key.to_owned(), 0);
+                }
+            }
+        }
         if actual.is_none() && !self.busy && self.connected {
             ui.label(
                 RichText::new("Unavailable on this camera")
@@ -756,12 +791,15 @@ impl App {
                     .color(MUTED),
             );
         }
-        if actual.is_some_and(|value| value < spec.min || value > maximum) {
+        if let Some(actual) = actual.filter(|value| *value < spec.min || *value > maximum) {
+            let (reported, minimum, maximum) = if spec.key == "exposure-ev" {
+                (exposure_display(actual), -8, 8)
+            } else {
+                (actual, spec.min, maximum)
+            };
             ui.label(
                 RichText::new(format!(
-                    "Camera currently reports {}. New values must be {}…{maximum}.",
-                    actual.unwrap(),
-                    spec.min
+                    "Camera currently reports {reported}. New values must be {minimum}…{maximum}."
                 ))
                 .size(10.0)
                 .color(AMBER),
@@ -1503,6 +1541,16 @@ impl App {
                     }
                 });
             });
+            if let Some(note) = preset.omission_note() {
+                let details = preset
+                    .omitted_controls
+                    .iter()
+                    .map(|(key, reason)| format!("{key}: {reason}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ui.label(RichText::new(note).size(11.0).color(AMBER))
+                    .on_hover_text(details);
+            }
             ui.separator();
         }
         section_title(ui, "Import / export");
@@ -1525,16 +1573,18 @@ impl App {
                     if bytes.len() > 1024 * 1024 {
                         anyhow::bail!("Preset JSON is larger than 1 MiB");
                     }
-                    let preset: Preset = serde_json::from_slice(&bytes)?;
+                    let preset = Preset::from_json(&bytes)?;
                     self.store.save_preset(&preset)?;
                     Ok(preset)
                 })();
                 match result {
                     Ok(preset) => {
-                        self.selected_preset = Some(preset.name);
+                        self.selected_preset = Some(preset.name.clone());
                         self.reload_presets();
-                        self.status =
-                            "Preset imported locally. Apply it to change the camera.".to_owned();
+                        self.status = preset_status(
+                            "Preset imported locally. Apply it to change the camera.",
+                            &preset,
+                        );
                         self.status_error = false;
                     }
                     Err(error) => self.error(format!("{error:#}")),
@@ -1844,6 +1894,9 @@ fn control_reason(state: &CameraState, key: &str, connected: bool, busy: bool) -
     if !connected {
         return Some("Waiting for the camera control connection".to_owned());
     }
+    if let Some(reason) = unsupported_control_reason(key) {
+        return Some(reason.to_owned());
+    }
     if let Some(reason) = state.unsupported.get(key) {
         return Some(reason.clone());
     }
@@ -1861,7 +1914,13 @@ fn control_reason(state: &CameraState, key: &str, connected: bool, busy: bool) -
         {
             Some("Select manual exposure to adjust this control".to_owned())
         }
-        "exposure-ev" | "exposure-lock" if state.values.get("exposure-mode") != Some(&0) => {
+        "exposure-ev" if state.values.get("exposure-mode") != Some(&0) => {
+            Some("Select Auto exposure to adjust camera brightness".to_owned())
+        }
+        "exposure-ev" if state.values.get("exposure-lock") == Some(&1) => {
+            Some("Unlock exposure to adjust camera brightness".to_owned())
+        }
+        "exposure-lock" if state.values.get("exposure-mode") != Some(&0) => {
             Some("Available in automatic exposure mode".to_owned())
         }
         "focus-manual" if state.values.get("focus-mode") != Some(&2) => {
@@ -1877,6 +1936,26 @@ fn control_reason(state: &CameraState, key: &str, connected: bool, busy: bool) -
             Some("Enable the colour LUT to adjust its intensity".to_owned())
         }
         _ => None,
+    }
+}
+
+fn exposure_display(raw: i32) -> i32 {
+    raw - 8
+}
+fn exposure_wire(step: i32) -> i32 {
+    step + 8
+}
+fn format_exposure_step(step: i32) -> String {
+    if step > 0 {
+        format!("+{step}")
+    } else {
+        step.to_string()
+    }
+}
+fn preset_status(message: &str, preset: &Preset) -> String {
+    match preset.omission_note() {
+        Some(note) => format!("{message}. {note}"),
+        None => message.to_owned(),
     }
 }
 
@@ -1954,7 +2033,7 @@ fn demo_state() -> CameraState {
         ..Default::default()
     };
     for spec in param_specs() {
-        if !spec.readback {
+        if !spec.readback || unsupported_control_reason(spec.key).is_some() {
             continue;
         }
         let value = if !spec.options.is_empty() {
@@ -1978,9 +2057,12 @@ fn demo_state() -> CameraState {
     ] {
         state.values.insert(key.to_owned(), value);
     }
+    for key in ["brightness", "hue", "gamma"] {
+        if let Some(reason) = unsupported_control_reason(key) {
+            state.unsupported.insert(key.to_owned(), reason.to_owned());
+        }
+    }
     for (key, reason) in [
-        ("hue", "Global hue does not process the image; use HSL"),
-        ("gamma", "Gamma is unavailable on S3"),
         ("zoom", "Use native framing controls"),
         ("zoom-speed", "Native framing is a direct crop"),
         ("dehaze", "Firmware placeholder"),
@@ -2062,6 +2144,85 @@ fn draw_demo_pattern(painter: &egui::Painter, rect: egui::Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exposure_steps_map_native_endpoints_and_neutral_without_stop_conversion() {
+        assert_eq!(
+            (
+                exposure_display(0),
+                exposure_display(8),
+                exposure_display(16)
+            ),
+            (-8, 0, 8)
+        );
+        for raw in 0..=16 {
+            assert_eq!(exposure_wire(exposure_display(raw)), raw);
+        }
+        assert_eq!(format_exposure_step(-8), "-8");
+        assert_eq!(format_exposure_step(0), "0");
+        assert_eq!(format_exposure_step(8), "+8");
+    }
+
+    #[test]
+    fn exposure_compensation_requires_auto_and_unlocked_exposure() {
+        let mut state = demo_state();
+        assert!(!state.values.contains_key("brightness"));
+        assert!(state.unsupported.contains_key("brightness"));
+        assert!(control_reason(&state, "exposure-ev", true, false).is_none());
+        state.values.insert("exposure-lock".to_owned(), 1);
+        assert!(
+            control_reason(&state, "exposure-ev", true, false)
+                .unwrap()
+                .contains("Unlock exposure")
+        );
+        state.values.insert("exposure-mode".to_owned(), 1);
+        assert!(
+            control_reason(&state, "exposure-ev", true, false)
+                .unwrap()
+                .contains("Select Auto")
+        );
+    }
+
+    #[test]
+    fn locked_compensation_reason_and_signed_value_are_visible_without_startup_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().to_owned()).unwrap();
+        let mut app = App::new(store, Settings::default(), None, 12345, true, true);
+        app.state.values.insert("exposure-ev".to_owned(), 16);
+        app.state.values.insert("exposure-lock".to_owned(), 1);
+        let context = egui::Context::default();
+        configure_theme(&context);
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1240.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| app.camera_panel(ui));
+            },
+        );
+        let labels: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Unlock exposure to adjust camera brightness")),
+            "{labels:?}"
+        );
+        assert!(labels.iter().any(|label| label == "+8"), "{labels:?}");
+        assert_eq!(app.state.values.get("exposure-ev"), Some(&16));
+        assert_eq!(app.state.values.get("exposure-lock"), Some(&1));
+        assert!(app.desired.is_empty());
+    }
 
     #[test]
     fn automatic_modes_disable_manual_controls_and_unknown_controls_stay_disabled() {
