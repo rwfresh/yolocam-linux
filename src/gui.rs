@@ -109,6 +109,7 @@ struct App {
     busy: bool,
     status: String,
     status_error: bool,
+    control_connection_error: Option<String>,
     desired: BTreeMap<String, i32>,
     write_only_choices: BTreeMap<String, i32>,
     desired_hsl: BTreeMap<(usize, usize), i32>,
@@ -193,6 +194,7 @@ impl App {
             busy: false,
             status,
             status_error,
+            control_connection_error: None,
             desired: BTreeMap::new(),
             write_only_choices: BTreeMap::new(),
             desired_hsl: BTreeMap::new(),
@@ -370,94 +372,106 @@ impl App {
     fn poll_worker(&mut self) {
         let events = self.worker.as_ref().map(Worker::poll).unwrap_or_default();
         for event in events {
-            match event {
-                Event::Connection(connected) => self.connected = connected,
-                Event::State(state) => {
-                    self.desired
-                        .retain(|key, value| state.values.get(key) != Some(value));
-                    self.desired_hsl.retain(|(axis, colour), value| {
-                        state
-                            .hsl
-                            .as_ref()
-                            .is_none_or(|hsl| hsl.values[*axis][*colour] != *value)
-                    });
-                    if self
-                        .desired_crop
+            self.handle_worker_event(event);
+        }
+    }
+
+    fn handle_worker_event(&mut self, event: Event) {
+        match event {
+            Event::Connection(connected) => {
+                self.connected = connected;
+                if connected {
+                    self.control_connection_error = None;
+                }
+            }
+            Event::ConnectionError(message) => {
+                self.control_connection_error = Some(message);
+            }
+            Event::State(state) => {
+                self.desired
+                    .retain(|key, value| state.values.get(key) != Some(value));
+                self.desired_hsl.retain(|(axis, colour), value| {
+                    state
+                        .hsl
                         .as_ref()
-                        .zip(state.eptz.as_ref())
-                        .is_some_and(|(want, actual)| crop_matches(want, actual))
-                    {
-                        self.desired_crop = None;
-                    }
-                    if self.desired_wb == state.wb_offsets {
-                        self.desired_wb = None;
-                    }
-                    self.state = *state;
+                        .is_none_or(|hsl| hsl.values[*axis][*colour] != *value)
+                });
+                if self
+                    .desired_crop
+                    .as_ref()
+                    .zip(state.eptz.as_ref())
+                    .is_some_and(|(want, actual)| crop_matches(want, actual))
+                {
+                    self.desired_crop = None;
                 }
-                Event::Status { message, error } => {
-                    self.status = message;
-                    self.status_error = error;
-                    if error {
-                        self.desired.clear();
-                        self.desired_hsl.clear();
-                        self.desired_crop = None;
-                        self.desired_wb = None;
-                    }
+                if self.desired_wb == state.wb_offsets {
+                    self.desired_wb = None;
                 }
-                Event::Busy(busy) => self.busy = busy,
-                Event::FirmwareRelease(release) => {
-                    self.release = Some(*release);
-                    self.prepared = None;
-                    self.firmware_phase.clear();
+                self.state = *state;
+            }
+            Event::Status { message, error } => {
+                self.status = message;
+                self.status_error = error;
+                if error {
+                    self.desired.clear();
+                    self.desired_hsl.clear();
+                    self.desired_crop = None;
+                    self.desired_wb = None;
                 }
-                Event::FirmwarePrepared(prepared) => {
-                    self.prepared = Some(*prepared);
-                    self.firmware_phase = "prepared".to_owned();
-                    self.firmware_percent = 100;
+            }
+            Event::Busy(busy) => self.busy = busy,
+            Event::FirmwareRelease(release) => {
+                self.release = Some(*release);
+                self.prepared = None;
+                self.firmware_phase.clear();
+            }
+            Event::FirmwarePrepared(prepared) => {
+                self.prepared = Some(*prepared);
+                self.firmware_phase = "prepared".to_owned();
+                self.firmware_percent = 100;
+            }
+            Event::FirmwareProgress { phase, percent } => {
+                self.firmware_phase = phase;
+                self.firmware_percent = percent;
+            }
+            Event::FirmwareFinished(version) => {
+                self.status = format!(
+                    "Firmware {} / build {} verified after reboot",
+                    version.firmware, version.build
+                );
+                self.status_error = false;
+                self.state.version = Some(version);
+                self.installing = false;
+                self.uncertain_update = false;
+                self.prepared = None;
+                self.firmware_phase = "verified".to_owned();
+                self.firmware_percent = 100;
+                if self.restore_preview_after_update {
+                    self.preview_attempted = false;
                 }
-                Event::FirmwareProgress { phase, percent } => {
-                    self.firmware_phase = phase;
-                    self.firmware_percent = percent;
-                }
-                Event::FirmwareFinished(version) => {
-                    self.status = format!(
-                        "Firmware {} / build {} verified after reboot",
-                        version.firmware, version.build
-                    );
-                    self.status_error = false;
-                    self.state.version = Some(version);
-                    self.installing = false;
-                    self.uncertain_update = false;
-                    self.prepared = None;
-                    self.firmware_phase = "verified".to_owned();
-                    self.firmware_percent = 100;
-                    if self.restore_preview_after_update {
-                        self.preview_attempted = false;
-                    }
+                self.restore_preview_after_update = false;
+            }
+            Event::FirmwareFailed { message, uncertain } => {
+                self.installing = false;
+                self.uncertain_update = uncertain;
+                self.error(message);
+                if !uncertain && self.restore_preview_after_update {
+                    self.preview_attempted = false;
                     self.restore_preview_after_update = false;
                 }
-                Event::FirmwareFailed { message, uncertain } => {
-                    self.installing = false;
-                    self.uncertain_update = uncertain;
-                    self.error(message);
-                    if !uncertain && self.restore_preview_after_update {
-                        self.preview_attempted = false;
-                        self.restore_preview_after_update = false;
-                    }
-                }
-                Event::PresetCaptured(preset) => match self.store.save_preset(&preset) {
-                    Ok(()) => {
-                        self.selected_preset = Some(preset.name.clone());
-                        self.status = preset_status(
-                            &format!("Saved preset {} from camera readbacks", preset.name),
-                            &preset,
-                        );
-                        self.status_error = false;
-                        self.reload_presets();
-                    }
-                    Err(error) => self.error(format!("{error:#}")),
-                },
             }
+            Event::PresetCaptured(preset) => match self.store.save_preset(&preset) {
+                Ok(()) => {
+                    self.selected_preset = Some(preset.name.clone());
+                    self.status = preset_status(
+                        &format!("Saved preset {} from camera readbacks", preset.name),
+                        &preset,
+                    );
+                    self.status_error = false;
+                    self.reload_presets();
+                }
+                Err(error) => self.error(format!("{error:#}")),
+            },
         }
     }
 
@@ -629,21 +643,49 @@ impl App {
         );
     }
 
-    fn footer(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+    fn can_reconnect(&self) -> bool {
+        !self.demo && !self.busy && !self.installing && !self.uncertain_update
+    }
+
+    fn displayed_status(&self) -> (&str, bool) {
+        if !self.connected
+            && !self.busy
+            && !self.installing
+            && !self.uncertain_update
+            && let Some(message) = &self.control_connection_error
+        {
+            (message, true)
+        } else {
+            (&self.status, self.status_error)
+        }
+    }
+
+    fn footer(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let (message, error) = self.displayed_status();
             ui.label(
-                RichText::new(if self.status_error { "!" } else { "·" })
+                RichText::new(if error { "!" } else { "·" })
                     .strong()
-                    .color(if self.status_error { ERROR } else { AMBER }),
+                    .color(if error { ERROR } else { AMBER }),
             );
             ui.add(
                 egui::Label::new(
-                    RichText::new(&self.status)
+                    RichText::new(message)
                         .size(12.0)
-                        .color(if self.status_error { ERROR } else { MUTED }),
+                        .color(if error { ERROR } else { MUTED }),
                 )
                 .wrap(),
             );
+            if !self.connected
+                && !self.demo
+                && matches!(self.tab, Tab::Camera | Tab::Colour)
+                && ui
+                    .add_enabled(self.can_reconnect(), egui::Button::new("Reconnect"))
+                    .on_disabled_hover_text("Reconnect is unavailable while firmware work or reboot verification is pending")
+                    .clicked()
+            {
+                self.send(Command::Connect);
+            }
         });
     }
 
@@ -1680,7 +1722,7 @@ impl App {
             }
             if ui
                 .add_enabled(
-                    !self.busy && !self.demo && !self.uncertain_update,
+                    self.can_reconnect(),
                     egui::Button::new("Reconnect"),
                 )
                 .clicked()
@@ -2144,6 +2186,95 @@ fn draw_demo_pattern(painter: &egui::Painter, rect: egui::Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_connection_error_survives_reconnect_progress_and_clears_after_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().to_owned()).unwrap();
+        let mut app = App::new(store, Settings::default(), None, 12345, true, true);
+        // Use sample state without creating a real worker or preview device.
+        app.demo = false;
+        let error = "The camera closed the control connection; command was not replayed";
+        app.handle_worker_event(Event::ConnectionError(error.to_owned()));
+        app.handle_worker_event(Event::Status {
+            message: error.to_owned(),
+            error: true,
+        });
+        app.handle_worker_event(Event::Connection(false));
+        app.handle_worker_event(Event::Status {
+            message: "Connecting to YoloCam…".to_owned(),
+            error: false,
+        });
+        assert_eq!(app.displayed_status(), (error, true));
+        assert!(app.can_reconnect());
+        assert!(control_reason(&app.state, "contrast", app.connected, app.busy).is_some());
+        let context = egui::Context::default();
+        configure_theme(&context);
+        for tab in [Tab::Camera, Tab::Colour] {
+            app.tab = tab;
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| app.footer(ui));
+            });
+            let labels: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert!(labels.iter().any(|label| label == error), "{labels:?}");
+            assert!(
+                labels.iter().any(|label| label == "Reconnect"),
+                "{labels:?}"
+            );
+        }
+        app.handle_worker_event(Event::Connection(true));
+        app.handle_worker_event(Event::Status {
+            message: "Camera connected".to_owned(),
+            error: false,
+        });
+        assert!(app.control_connection_error.is_none());
+        assert_eq!(app.displayed_status(), ("Camera connected", false));
+        assert!(control_reason(&app.state, "contrast", app.connected, app.busy).is_none());
+        assert!(
+            app.settings.preview_enabled,
+            "Control recovery preserves preview choice"
+        );
+        assert!(app.worker.is_none());
+        assert!(!app.preview.is_running());
+    }
+
+    #[test]
+    fn reconnect_action_cannot_interrupt_firmware_or_bypass_reboot_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().to_owned()).unwrap();
+        let mut app = App::new(store, Settings::default(), None, 12345, false, true);
+        app.demo = false;
+        app.connected = false;
+        app.control_connection_error = Some("Previous control error".to_owned());
+        app.status = "Downloading verified firmware".to_owned();
+        app.handle_worker_event(Event::Busy(true));
+        assert!(!app.can_reconnect());
+        assert_eq!(
+            app.displayed_status(),
+            ("Downloading verified firmware", false)
+        );
+        app.handle_worker_event(Event::Busy(false));
+        app.installing = true;
+        assert!(!app.can_reconnect());
+        app.handle_worker_event(Event::FirmwareFailed {
+            message: "Firmware verification is pending".to_owned(),
+            uncertain: true,
+        });
+        assert!(!app.can_reconnect());
+        assert_eq!(
+            app.displayed_status(),
+            ("Firmware verification is pending", true)
+        );
+        app.uncertain_update = false;
+        assert!(app.can_reconnect());
+    }
 
     #[test]
     fn exposure_steps_map_native_endpoints_and_neutral_without_stop_conversion() {

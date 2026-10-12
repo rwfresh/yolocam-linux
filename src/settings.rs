@@ -125,9 +125,9 @@ impl Preset {
         })
     }
 
-    /// v0.1.0 presets included controls that the camera acknowledged without
-    /// changing its image. Keep the usable settings and a visible migration
-    /// note; never reinterpret a legacy brightness value as exposure steps.
+    /// Older presets can include commands that are nonfunctional or unsafe.
+    /// Keep the usable settings and a visible migration note; never reinterpret
+    /// a legacy brightness value as exposure steps.
     pub fn normalize(&mut self) {
         let omitted = &mut self.omitted_controls;
         self.values.retain(|key, _| {
@@ -466,6 +466,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_face_roi_presets_are_omitted_without_losing_working_controls() {
+        let bytes = br#"{"schema_version":1,"name":"Legacy face region","values":{"face-roi":1,"contrast":42},"crop":null,"hsl":null,"profile":null,"wb_offsets":null}"#;
+        let preset = Preset::from_json(bytes).unwrap();
+        assert!(!preset.values.contains_key("face-roi"));
+        assert_eq!(preset.values.get("contrast"), Some(&42));
+        assert!(preset.omission_note().unwrap().contains("face-roi"));
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().to_owned()).unwrap();
+        store.save_preset(&preset).unwrap();
+        let loaded = store.load_preset(&preset.name).unwrap();
+        assert!(!loaded.values.contains_key("face-roi"));
+        assert_eq!(loaded.values.get("contrast"), Some(&42));
+    }
+
+    #[test]
     fn malformed_import_is_rejected_before_camera_io() {
         let mut preset = Preset::capture("Office", &CameraState::default()).unwrap();
         preset.values.insert("contrast".to_owned(), 101);
@@ -474,7 +489,7 @@ mod tests {
         preset.values.insert("unknown-control".to_owned(), 0);
         assert!(preset.validate().is_err());
         preset.values.clear();
-        preset.values.insert("face-roi".to_owned(), 1);
+        preset.values.insert("au-mic-type".to_owned(), 1);
         assert!(preset.validate().is_err());
     }
 

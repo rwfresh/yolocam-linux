@@ -46,9 +46,9 @@ camera settings, colour, firmware, local presets and device information.
 - Optional audio and HDMI controls when the camera reports support.
 - Local camera presets and a persistent preview preference.
 
-Readable controls use actual camera readback. The two write-only choices,
-face focus region and microphone type, use explicit Apply buttons and show
-acknowledgements; their initial state is unknown and failed writes are not replayed.
+Readable controls use actual camera readback. The write-only microphone type
+uses an explicit Apply button and shows acknowledgements; its initial state is
+unknown and failed writes are not replayed.
 Rejected or missing capabilities are disabled. Manual exposure, focus and
 white balance controls follow their modes.
 The app serializes control traffic, coalesces slider drags, sends heartbeats and
@@ -109,6 +109,12 @@ The S3 supports several shared protocol commands only as stored placeholders
 or rejects them. Legacy brightness, dehaze, shadows, highlights, global hue/gamma and
 unsupported storage/lighting features are not presented as working controls.
 See [hardware support](docs/hardware-support.md).
+
+**Face detection ROI:** the former “Face exposure region” control is disabled.
+Its command hangs the S3 1.0.4 settings handler, leaving video running while
+all camera controls stop responding. If an older app triggered this, unplug
+and reconnect the camera's USB cable, then use version 0.1.2 or newer.
+Reconnect alone cannot repair the camera's stalled settings handler.
 
 ## CLI
 

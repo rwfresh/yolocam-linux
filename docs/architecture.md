@@ -10,7 +10,8 @@ Capabilities come from version/read responses. Firmware-aware crop replaces
 legacy zoom, HSL uses the native 24-field structure, and profiles use ID/style/
 HDR-bank fields. This layer is shared by the CLI and GUI.
 
-Known nonfunctional brightness/hue/gamma commands are rejected before I/O;
+Known nonfunctional brightness/hue/gamma and unsafe face ROI commands are
+rejected before I/O;
 their legacy specifications remain only for preset migration. Exposure
 compensation uses native 0…16 (neutral 8); the GUI displays the equivalent
 −8…+8 scale. Every EV write checks fresh camera mode and exposure-lock readbacks.

@@ -8,7 +8,7 @@ been tested, and its firmware updater accepts only the S3 `ch131b` model.
 |---|---|---|
 | Webcam video | Standard Linux UVC/V4L2 | Native MJPEG preview; OBS/video calls capture directly |
 | USB control link | Standard CDC NCM | USB DHCP address discovered automatically |
-| Image/exposure/WB/focus | Vendor TCP protobuf | Readable settings verified; write-only face region uses explicit acknowledgement |
+| Image/exposure/WB/focus | Vendor TCP protobuf | Readable settings verified; face ROI command is blocked |
 | Exposure compensation | Command 15 | Auto exposure, unlocked; native 0…16, neutral 8; GUI displays −8…+8 |
 | HDR | Command 98 | Added in S3 1.0.4 |
 | Native crop | Command 117 | Replaces command 13 from S3 0.0.8 onward |
@@ -41,10 +41,19 @@ corresponding bank; it does not download colour profile packages. Existing
 installed profiles can be selected. Audio/HDMI settings depend on capabilities
 reported by the connected camera and optional hardware.
 
-Face exposure region (214) and microphone type (79) are write-only. The app
-cannot discover their initial selection. It sends these choices once on an
-explicit Apply action and displays an acknowledgement, without replaying a
-lost response or including them in readback presets.
+Face detection ROI (214), previously labelled “Face exposure region”, is
+blocked before socket I/O. On the tested S3 firmware 1.0.4 its handler never
+completes the internal reply, stalling subsequent camera settings commands.
+Version requests and independent face notifications still arrive, and UVC
+video continues. Sending Off or reconnecting cannot clear the stalled handler;
+restart the camera before using a corrected app. Existing face-roi preset
+entries are omitted with a notice. This command is not a verified exposure
+metering control.
+
+Microphone type (79) remains write-only. The app cannot discover its initial
+selection. It sends the choice once on an explicit Apply action and displays
+an acknowledgement, without replaying a lost response or including it in
+readback presets.
 
 The app's single control worker and per-user session lock prevent its own
 clients from fighting over a camera connection. Other vendor control tools

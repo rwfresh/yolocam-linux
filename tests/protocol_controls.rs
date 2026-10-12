@@ -11,7 +11,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yolocam_linux::{
-    camera::{Camera, CameraVersion},
+    camera::{Camera, CameraVersion, unsupported_control_reason},
     pb,
     protocol::{Client, MAX_PAYLOAD_SIZE, pack_frame, unpack_frame},
 };
@@ -34,6 +34,34 @@ fn response(request: &pb::Message, value: Option<pb::command_body::Value>) -> pb
         id: request.id,
         resp_code: 200,
         body: value.map(|value| pb::CommandBody { value: Some(value) }),
+        ..Default::default()
+    }
+}
+
+fn face_notification(sequence: u32) -> pb::Message {
+    pb::Message {
+        r#type: 5,
+        seq: sequence,
+        id: 59,
+        resp_code: 200,
+        body: Some(pb::CommandBody {
+            value: Some(pb::command_body::Value::ListRectF(pb::ListRectF {
+                values: vec![
+                    pb::RectF {
+                        left: 0.2,
+                        top: 0.1,
+                        right: 0.4,
+                        bottom: 0.5,
+                    },
+                    pb::RectF {
+                        left: 0.6,
+                        top: 0.3,
+                        right: 0.8,
+                        bottom: 0.7,
+                    },
+                ],
+            })),
+        }),
         ..Default::default()
     }
 }
@@ -154,14 +182,7 @@ fn stale_responses_and_notifications_cannot_satisfy_a_request() {
     let (mut client, worker) = server(|listener| {
         let mut stream = accept(&listener);
         let request = read_request(&mut stream);
-        send(
-            &mut stream,
-            &pb::Message {
-                r#type: 5,
-                id: 59,
-                ..Default::default()
-            },
-        );
+        send(&mut stream, &face_notification(request.seq));
         let mut old = response(&request, Some(pb::command_body::Value::IntVal(7)));
         old.seq -= 1;
         send(&mut stream, &old);
@@ -181,6 +202,52 @@ fn stale_responses_and_notifications_cannot_satisfy_a_request() {
         reply.body.unwrap().value,
         Some(pb::command_body::Value::IntVal(42))
     );
+    worker.join().unwrap();
+}
+
+#[test]
+fn face_notifications_do_not_hide_valid_heartbeat_and_control_replies() {
+    let (mut client, worker) = server(|listener| {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        for expected in [(2, 215), (1, 9), (2, 215)] {
+            let request = read_request(&mut stream);
+            assert_eq!((request.r#type, request.id), expected);
+            if request.id == 215 {
+                assert_eq!(
+                    request.body.as_ref().unwrap().value,
+                    Some(pb::command_body::Value::IntVal(1))
+                );
+            }
+            // Camera notifications can carry the same sequence and success
+            // code as a pending request. Neither those nor stale/wrong-ID
+            // responses can substitute for its actual acknowledgement.
+            send(&mut stream, &face_notification(request.seq));
+            let mut stale = response(&request, Some(pb::command_body::Value::IntVal(99)));
+            stale.seq = request.seq.wrapping_sub(1);
+            send(&mut stream, &stale);
+            let mut wrong_id = response(&request, Some(pb::command_body::Value::IntVal(99)));
+            wrong_id.id = if request.id == 215 { 9 } else { 215 };
+            send(&mut stream, &wrong_id);
+            let value = (request.id == 9).then_some(pb::command_body::Value::IntVal(48));
+            send(&mut stream, &response(&request, value));
+        }
+    });
+    client.connect().unwrap();
+    let contrast = client.get(9).unwrap();
+    assert_eq!(
+        contrast.body.unwrap().value,
+        Some(pb::command_body::Value::IntVal(48))
+    );
+    let heartbeat = client.set_int(215, 1).unwrap();
+    assert_eq!(
+        (heartbeat.r#type, heartbeat.id, heartbeat.resp_code),
+        (4, 215, 200)
+    );
+    assert!(heartbeat.body.is_none());
+    assert!(client.is_connected());
     worker.join().unwrap();
 }
 
@@ -249,15 +316,9 @@ fn notification_callbacks_can_abort_without_replaying_a_firmware_action() {
 fn notifications_do_not_extend_the_single_request_deadline() {
     let (mut client, worker) = server(|listener| {
         let mut stream = accept(&listener);
-        let _request = read_request(&mut stream);
-        let notify = pack_frame(
-            &pb::Message {
-                r#type: 5,
-                id: 59,
-                ..Default::default()
-            }
-            .encode_to_vec(),
-        );
+        let request = read_request(&mut stream);
+        let mut notify = pack_frame(&face_notification(request.seq).encode_to_vec());
+        notify[1] = 0;
         for _ in 0..12 {
             if stream.write_all(&notify).is_err() {
                 break;
@@ -597,22 +658,49 @@ fn a_missing_optional_control_is_disabled_without_losing_other_capabilities() {
 fn write_only_controls_use_acknowledgements_and_never_fabricate_readback() {
     let (mut camera, worker) = mock_camera(|stream| {
         let set = read_request(stream);
-        assert_eq!((set.r#type, set.id), (2, 214));
+        assert_eq!((set.r#type, set.id), (2, 79));
         assert_eq!(
             set.body.as_ref().unwrap().value,
             Some(pb::command_body::Value::IntVal(1))
         );
         send(stream, &response(&set, None));
     });
-    assert!(!camera.state.values.contains_key("face-roi"));
+    assert!(!camera.state.values.contains_key("au-mic-type"));
     assert!(
         camera
-            .get_param("face-roi")
+            .get_param("au-mic-type")
             .unwrap_err()
             .to_string()
             .contains("write-only")
     );
-    assert_eq!(camera.set_param("face-roi", 1).unwrap(), 1);
-    assert_eq!(camera.state.values["face-roi"], 1);
+    assert_eq!(camera.set_param("au-mic-type", 1).unwrap(), 1);
+    assert_eq!(camera.state.values["au-mic-type"], 1);
+    worker.join().unwrap();
+}
+
+#[test]
+fn face_roi_reads_and_both_write_choices_are_rejected_without_wire_traffic() {
+    let (mut camera, worker) = mock_camera(|stream| {
+        // After the connection heartbeat, the only permitted request is this
+        // independent readable control. Any CID214 GET or SET fails the test.
+        let read = read_request(stream);
+        assert_eq!((read.r#type, read.id), (1, 9));
+        send(
+            stream,
+            &response(&read, Some(pb::command_body::Value::IntVal(48))),
+        );
+    });
+    let reason = unsupported_control_reason("face-roi")
+        .expect("CID214 must be blocked before reaching the camera");
+    // A stale value from an older app must not re-enable the dangerous command.
+    camera.state.values.insert("face-roi".into(), 0);
+    assert!(camera.get_param("face-roi").is_err());
+    for value in [0, 1] {
+        let error = camera.set_param("face-roi", value).unwrap_err();
+        assert!(format!("{error:#}").contains(reason));
+    }
+    assert_eq!(camera.state.values["face-roi"], 0);
+    assert!(camera.client.is_connected());
+    assert_eq!(camera.get_param("contrast").unwrap(), 48);
     worker.join().unwrap();
 }

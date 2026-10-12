@@ -224,7 +224,7 @@ pub struct ParamSpec {
 }
 
 /// Retain legacy specifications for preset migration, but never use commands
-/// that acknowledge changes without processing the image on tested S3 firmware.
+/// that are nonfunctional or hang the settings handler on tested S3 firmware.
 pub fn unsupported_control_reason(key: &str) -> Option<&'static str> {
     match key {
         "brightness" => Some(
@@ -232,6 +232,9 @@ pub fn unsupported_control_reason(key: &str) -> Option<&'static str> {
         ),
         "hue" => Some("Global hue is not functional on S3; use HSL"),
         "gamma" => Some("Gamma is not functional on S3"),
+        "face-roi" => Some(
+            "Face detection ROI is disabled: command 214 hangs the S3 1.0.4 settings handler; restart the camera if controls stopped responding",
+        ),
         _ => None,
     }
 }
@@ -501,8 +504,8 @@ pub fn param_specs() -> &'static [ParamSpec] {
         ),
         param!(
             "face-roi",
-            "Face exposure region",
-            "Focus",
+            "Face detection ROI",
+            "Unsupported",
             214,
             0,
             1,
@@ -817,13 +820,13 @@ impl Camera {
             .iter()
             .find(|spec| spec.key == key)
             .context("unknown camera parameter")?;
+        if let Some(reason) = unsupported_control_reason(key) {
+            bail!("{reason}");
+        }
         ensure!(
             spec.readback,
             "{key} is write-only; the camera does not report its current value"
         );
-        if let Some(reason) = unsupported_control_reason(key) {
-            bail!("{reason}");
-        }
         if self.uses_eptz() && matches!(key, "zoom" | "zoom-speed") {
             bail!("use native ePTZ on this firmware");
         }

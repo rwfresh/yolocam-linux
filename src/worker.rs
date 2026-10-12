@@ -71,6 +71,7 @@ pub struct PreparedSummary {
 #[derive(Clone, Debug)]
 pub enum Event {
     Connection(bool),
+    ConnectionError(String),
     State(Box<CameraState>),
     Status { message: String, error: bool },
     Busy(bool),
@@ -344,6 +345,27 @@ fn run_worker(
             break;
         }
 
+        // A reconnect is a queue barrier. Handle it before the automatic
+        // connection attempt so one request cannot refresh, disconnect, then
+        // refresh again. Leave following controls queued for the new session.
+        if matches!(pending.commands.front(), Some(Command::Connect)) {
+            while matches!(pending.commands.front(), Some(Command::Connect)) {
+                pending.commands.pop_front();
+            }
+            if expected_update.is_some() {
+                status(
+                    &events,
+                    "Firmware verification is pending; verify the camera after reboot before reconnecting controls",
+                    true,
+                );
+            } else {
+                camera.disconnect();
+                connected = false;
+                reconnect_at = Instant::now();
+                let _ = events.send(Event::Connection(false));
+            }
+        }
+
         if !connected && Instant::now() >= reconnect_at && expected_update.is_none() {
             status(&events, "Connecting to YoloCam…", false);
             match camera.connect() {
@@ -361,12 +383,10 @@ fn run_worker(
                 Err(error) => {
                     camera.disconnect();
                     reconnect_at = Instant::now() + Duration::from_secs(5);
+                    let message = format!("Camera unavailable: {error:#}. Retrying…");
+                    let _ = events.send(Event::ConnectionError(message.clone()));
                     let _ = events.send(Event::Connection(false));
-                    status(
-                        &events,
-                        format!("Camera unavailable: {error:#}. Retrying…"),
-                        true,
-                    );
+                    status(&events, message, true);
                 }
             }
         }
@@ -378,12 +398,10 @@ fn run_worker(
                     connected = false;
                     camera.disconnect();
                     reconnect_at = Instant::now() + Duration::from_secs(1);
+                    let message = format!("Camera connection lost: {error:#}. Reconnecting…");
+                    let _ = events.send(Event::ConnectionError(message.clone()));
                     let _ = events.send(Event::Connection(false));
-                    status(
-                        &events,
-                        format!("Camera connection lost: {error:#}. Reconnecting…"),
-                        true,
-                    );
+                    status(&events, message, true);
                 }
             }
         }
@@ -391,15 +409,6 @@ fn run_worker(
         let Some(command) = pending.commands.pop_front() else {
             continue;
         };
-
-        if matches!(command, Command::Connect) {
-            if connected {
-                camera.disconnect();
-                connected = false;
-            }
-            reconnect_at = Instant::now();
-            continue;
-        }
 
         if matches!(command, Command::VerifyUpdate) {
             let Some((expected, before)) = expected_update.as_ref() else {
@@ -644,11 +653,13 @@ fn run_worker(
                 status(&events, message, false);
             }
             Err(error) => {
-                status(&events, format!("{error:#}"), true);
+                let message = format!("{error:#}");
+                status(&events, message.clone(), true);
                 if transport_error(&error) || !camera.client.is_connected() {
                     connected = false;
                     camera.disconnect();
                     reconnect_at = Instant::now() + Duration::from_secs(1);
+                    let _ = events.send(Event::ConnectionError(message));
                     let _ = events.send(Event::Connection(false));
                 }
                 let _ = events.send(Event::State(Box::new(camera.state.clone())));
@@ -1216,25 +1227,38 @@ mod tests {
         camera.disconnect();
     }
 
+    type ControlRequests = Vec<(i32, i32, Option<u32>)>;
+
     struct FakeCamera {
         port: u16,
         stop: Arc<AtomicBool>,
         writes: Arc<AtomicU32>,
         value: Arc<AtomicU32>,
+        requests: Arc<Mutex<ControlRequests>>,
         thread: Option<JoinHandle<()>>,
     }
 
     impl FakeCamera {
         fn lost_first_ack(applied_before_disconnect: bool) -> Self {
+            Self::new(true, applied_before_disconnect)
+        }
+
+        fn normal() -> Self {
+            Self::new(false, false)
+        }
+
+        fn new(lose_first_ack: bool, applied_before_disconnect: bool) -> Self {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
             listener.set_nonblocking(true).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let writes = Arc::new(AtomicU32::new(0));
             let value = Arc::new(AtomicU32::new(42));
+            let requests = Arc::new(Mutex::new(Vec::new()));
             let thread_stop = Arc::clone(&stop);
             let thread_writes = Arc::clone(&writes);
             let thread_value = Arc::clone(&value);
+            let thread_requests = Arc::clone(&requests);
             let thread = thread::spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -1247,6 +1271,8 @@ mod tests {
                                 &thread_stop,
                                 &thread_writes,
                                 &thread_value,
+                                &thread_requests,
+                                lose_first_ack,
                                 applied_before_disconnect,
                             );
                         }
@@ -1262,8 +1288,20 @@ mod tests {
                 stop,
                 writes,
                 value,
+                requests,
                 thread: Some(thread),
             }
+        }
+
+        fn count_requests(&self, kind: i32, cid: i32) -> usize {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(request_kind, request_cid, _)| {
+                    *request_kind == kind && *request_cid == cid
+                })
+                .count()
         }
     }
 
@@ -1281,6 +1319,8 @@ mod tests {
         stop: &AtomicBool,
         writes: &AtomicU32,
         value: &AtomicU32,
+        requests: &Mutex<ControlRequests>,
+        lose_first_ack: bool,
         applied_before_disconnect: bool,
     ) -> Result<()> {
         use crate::pb::{self, command_body::Value};
@@ -1295,6 +1335,17 @@ mod tests {
             frame.resize(8 + length, 0);
             stream.read_exact(&mut frame[8..])?;
             let request = pb::Message::decode(crate::protocol::unpack_frame(&frame)?.as_slice())?;
+            let raw = request.body.and_then(|body| body.value).and_then(|value| {
+                if let Value::IntVal(value) = value {
+                    Some(value)
+                } else {
+                    None
+                }
+            });
+            requests
+                .lock()
+                .unwrap()
+                .push((request.r#type, request.id, raw));
             let mut response = pb::Message {
                 r#type: 4,
                 seq: request.seq,
@@ -1311,21 +1362,23 @@ mod tests {
                     ..Default::default()
                 })),
                 (1, 9) => Some(Value::IntVal(value.load(Ordering::Acquire))),
-                (2, 9 | 214) => {
-                    let Some(Value::IntVal(requested)) = request.body.and_then(|body| body.value)
-                    else {
-                        bail!("invalid write");
-                    };
+                // A readable audio control keeps the write-only microphone
+                // selector available without inventing its current value.
+                (1, 73) => Some(Value::IntVal(60)),
+                (2, 9 | 79) => {
+                    let requested = raw.context("invalid write")?;
                     let count = writes.fetch_add(1, Ordering::AcqRel);
-                    if count == 0 {
-                        if applied_before_disconnect {
+                    if lose_first_ack && count == 0 {
+                        if applied_before_disconnect && request.id == 9 {
                             value.store(requested, Ordering::Release);
                         }
                         // Simulate the exact ambiguous write boundary: the
                         // client cannot infer whether the camera applied it.
                         return Ok(());
                     }
-                    value.store(requested, Ordering::Release);
+                    if request.id == 9 {
+                        value.store(requested, Ordering::Release);
+                    }
                     Some(Value::IntVal(requested))
                 }
                 _ => None,
@@ -1339,19 +1392,83 @@ mod tests {
         Ok(())
     }
 
-    fn wait_for_state(worker: &Worker, value: i32) {
+    fn wait_for_state_events(worker: &Worker, value: i32) -> Vec<Event> {
         let deadline = Instant::now() + Duration::from_secs(20);
+        let mut received = Vec::new();
         while Instant::now() < deadline {
-            for event in worker.poll() {
-                if let Event::State(state) = event
-                    && state.values.get("contrast") == Some(&value)
-                {
-                    return;
-                }
+            let events = worker.poll();
+            let found = events.iter().any(|event| {
+                matches!(event,
+                    Event::State(state) if state.values.get("contrast") == Some(&value)
+                )
+            });
+            received.extend(events);
+            if found {
+                return received;
             }
             thread::sleep(Duration::from_millis(10));
         }
         panic!("Worker did not confirm the requested value {value}");
+    }
+
+    fn wait_for_state(worker: &Worker, value: i32) {
+        wait_for_state_events(worker, value);
+    }
+
+    fn wait_for_reconnection(worker: &Worker, value: i32) -> Vec<Event> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut received = Vec::new();
+        let mut disconnected = false;
+        let mut reconnected = false;
+        while Instant::now() < deadline {
+            let events = worker.poll();
+            let mut found = false;
+            for event in &events {
+                match event {
+                    Event::Connection(false) => disconnected = true,
+                    Event::Connection(true) if disconnected => reconnected = true,
+                    Event::State(state)
+                        if reconnected && state.values.get("contrast") == Some(&value) =>
+                    {
+                        found = true;
+                    }
+                    _ => {}
+                }
+            }
+            received.extend(events);
+            if found {
+                return received;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("Worker did not reconnect and confirm the requested value {value}");
+    }
+
+    fn worker_with_queued_commands(port: u16, queued: impl IntoIterator<Item = Command>) -> Worker {
+        // Queue before starting the thread so the disconnected/manual-retry
+        // ordering regression is deterministic, independent of scheduling.
+        let (tx, commands) = mpsc::channel();
+        let (events, rx) = mpsc::channel();
+        for command in queued {
+            tx.send(command).unwrap();
+        }
+        let busy = Arc::new(AtomicBool::new(false));
+        let thread_busy = Arc::clone(&busy);
+        let join = thread::spawn(move || {
+            run_worker(
+                commands,
+                events,
+                thread_busy,
+                Some(Ipv4Addr::LOCALHOST),
+                port,
+            )
+        });
+        Worker {
+            tx,
+            rx,
+            busy,
+            join: Some(join),
+        }
     }
 
     #[test]
@@ -1431,28 +1548,119 @@ mod tests {
     }
 
     #[test]
-    fn write_only_command_lost_ack_is_reported_without_auto_replay() {
+    fn write_only_lost_ack_reconnects_without_replay_and_restores_ordinary_controls() {
         let fake = FakeCamera::lost_first_ack(true);
         let mut worker = Worker::new(Some(Ipv4Addr::LOCALHOST), fake.port);
         wait_for_state(&worker, 42);
         worker
             .send(Command::SetParam {
-                key: "face-roi".to_owned(),
+                key: "au-mic-type".to_owned(),
                 value: 1,
             })
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut reported = false;
-        while Instant::now() < deadline && !reported {
-            reported = worker
-                .poll()
+        let mut events = wait_for_reconnection(&worker, 42);
+        assert!(events.iter().any(|event| matches!(event,
+            Event::ConnectionError(message) if message.contains("write")
+        )));
+        assert!(
+            events
                 .iter()
-                .any(|event| matches!(event, Event::Status { error: true, .. }));
-            thread::sleep(Duration::from_millis(10));
-        }
+                .any(|event| matches!(event, Event::Status { error: true, .. })),
+            "The uncertain write must be visible to the user"
+        );
+        assert_eq!(fake.count_requests(2, 79), 1);
+        assert_eq!(fake.count_requests(1, 79), 0);
+        assert_eq!(fake.count_requests(1, 1), 2);
+        worker
+            .send(Command::SetParam {
+                key: "contrast".to_owned(),
+                value: 73,
+            })
+            .unwrap();
+        events.extend(wait_for_state_events(&worker, 73));
+        assert_eq!(fake.count_requests(2, 79), 1);
+        assert_eq!(fake.count_requests(2, 9), 1);
+        assert_eq!(fake.value.load(Ordering::Acquire), 73);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Busy(true)))
+        );
+        assert!(!worker.is_busy());
         worker.shutdown();
-        assert!(reported, "The uncertain write must be visible to the user");
-        assert_eq!(fake.writes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn manual_reconnect_refreshes_once_reports_connection_and_preserves_the_next_control() {
+        for already_connected in [false, true] {
+            let fake = FakeCamera::normal();
+            let next_control = Command::SetParam {
+                key: "contrast".to_owned(),
+                value: 73,
+            };
+            let mut worker = if already_connected {
+                let worker = Worker::new(Some(Ipv4Addr::LOCALHOST), fake.port);
+                wait_for_state(&worker, 42);
+                worker.send(Command::Connect).unwrap();
+                worker.send(next_control).unwrap();
+                worker
+            } else {
+                worker_with_queued_commands(fake.port, [Command::Connect, next_control])
+            };
+            let events = wait_for_reconnection(&worker, 73);
+            let connections: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Connection(connected) => Some(*connected),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(connections, vec![false, true]);
+            assert_eq!(
+                fake.count_requests(1, 1),
+                if already_connected { 2 } else { 1 }
+            );
+            assert_eq!(fake.count_requests(2, 9), 1);
+            assert_eq!(fake.value.load(Ordering::Acquire), 73);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Busy(true)))
+            );
+            worker.shutdown();
+        }
+    }
+
+    #[test]
+    fn reconnect_behind_an_ordinary_command_remains_a_barrier_in_the_next_iteration() {
+        let fake = FakeCamera::normal();
+        let mut worker = Worker::new(Some(Ipv4Addr::LOCALHOST), fake.port);
+        wait_for_state(&worker, 42);
+        worker.send(Command::Refresh).unwrap();
+        worker.send(Command::Connect).unwrap();
+        worker
+            .send(Command::SetParam {
+                key: "contrast".to_owned(),
+                value: 73,
+            })
+            .unwrap();
+        let events = wait_for_reconnection(&worker, 73);
+        assert_eq!(
+            fake.count_requests(1, 1),
+            3,
+            "Initial, queued refresh, reconnect"
+        );
+        let connections: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Connection(connected) => Some(*connected),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(connections, vec![false, true]);
+        assert_eq!(fake.count_requests(2, 9), 1);
+        assert_eq!(fake.value.load(Ordering::Acquire), 73);
+        worker.shutdown();
     }
 
     #[test]

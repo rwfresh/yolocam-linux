@@ -143,6 +143,11 @@ fn session_lock() -> Result<File> {
 fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    if let Some(Command::Get { parameter } | Command::Set { parameter, .. }) = &args.command
+        && let Some(reason) = unsupported_control_reason(parameter)
+    {
+        bail!("{reason}");
+    }
     match args.command {
         Some(Command::Diagnose) => return print_json(discovery::diagnostics()),
         Some(Command::Controls) => return print_json(param_specs().iter().map(|p| {

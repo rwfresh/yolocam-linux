@@ -103,3 +103,24 @@ from **70.83** to **169.16**, with approximately **30 fps** capture. A direct EV
 write while locked was rejected with an unlock instruction, and a direct
 legacy brightness write was rejected without the misleading readback error.
 The original compensation and lock were restored.
+
+## v0.1.2 face ROI correction
+
+On 2026-10-12, an S3 on firmware 1.0.4/build 1349 stopped answering camera
+settings commands after command 214 was sent from the app's former “Face
+exposure region” control. UVC preview, version requests and face-box
+notifications continued. A fresh connection still received version information
+but no heartbeat or contrast reply; sending Off did not recover the handler.
+This is a camera-side command-queue stall that needs a camera restart.
+
+Version 0.1.2 rejects face-roi GET and both SET choices locally, removes the
+active control, and omits legacy preset entries with a notice. Simulated-camera
+regressions prove no command 214 is sent, valid nonempty face notifications do
+not substitute for replies, and notifications cannot extend a request deadline.
+Other regressions verify automatic recovery after a lost write-only
+acknowledgement without replay, manual reconnect ordering, a retained connection
+error, and recovery buttons that respect firmware/reboot verification barriers.
+
+Formatting, Clippy with warnings denied and all **83 tests** passed. Firmware
+flashing remains unvalidated on physical hardware; this correction does not
+change or install camera firmware.
