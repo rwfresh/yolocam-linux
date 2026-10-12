@@ -39,12 +39,15 @@ camera settings, colour, firmware, local presets and device information.
 
 - Image controls, auto/manual exposure, shutter and ISO, anti-flicker, white
   balance, focus modes, manual lens position and HDR.
+- Click-to-focus in AF-S and movable AF-C regions on verified S3 firmware
+  1.0.4/build 1349, using the camera's actual region readback.
 - Native electronic pan/tilt/zoom and four crop presets on newer S3 firmware.
 - Hue, saturation and lightness for eight colour ranges, with the HSL switch.
 - Installed colour profile/style selection in the active SDR or HDR bank.
 - Colour LUT enable/intensity, import of a 5,508-entry packed LUT and reset.
 - Optional audio and HDMI controls when the camera reports support.
-- Local camera presets and a persistent preview preference.
+- Local camera presets, compatibility checks before applying their settings,
+  and persistent preview preferences.
 
 Readable controls use actual camera readback. The write-only microphone type
 uses an explicit Apply button and shows acknowledgements; its initial state is
@@ -67,8 +70,24 @@ notice for legacy brightness; its old value is never converted to exposure.
 before OBS or a video-call app opens the same capture device. Camera controls
 continue to work while preview is paused. Video is decoded directly from V4L2
 MJPEG buffers in Rust, without an external video process or a local web server.
-The built-in preview uses 720p at 30 fps; OBS and video calls negotiate their
-own capture format directly with the Linux driver.
+The built-in preview defaults to 720p at 30 fps. Its mode selector lists the
+actual MJPEG resolutions and frame intervals advertised by the video device,
+including 1080p/60 and 4K/30 on the tested S3. Changing preview mode releases
+the previous capture session before starting another. OBS and video calls
+negotiate their own capture format directly with the Linux driver.
+
+**Focus targets:** select AF-S or AF-C and start preview. Click inside the
+video image to move the focus region; AF-C also lets you drag the displayed
+region. The app preserves the camera's current region size, checks fresh
+focus-mode/area readbacks, and verifies the applied region. Face and Manual
+focus do not accept these interactions. Unverified firmware remains disabled.
+This uses focus-target command 24, separate from the blocked face ROI command.
+
+**Compatibility:** HDR requires frame rates of 30 fps or lower. Camera controls,
+preview mode choices and presets explain incompatible choices. Complete preset
+checks run before settings writes, including mode dependencies, firmware
+capabilities and the colour profile's HDR bank. Valid presets change only their
+specified settings and apply HDR/frame-rate transitions in a compatible order.
 
 ## Firmware updater
 

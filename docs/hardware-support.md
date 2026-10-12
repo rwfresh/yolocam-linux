@@ -6,7 +6,7 @@ been tested, and its firmware updater accepts only the S3 `ch131b` model.
 
 | Feature | Interface | Firmware notes |
 |---|---|---|
-| Webcam video | Standard Linux UVC/V4L2 | Native MJPEG preview; OBS/video calls capture directly |
+| Webcam video | Standard Linux UVC/V4L2 | Native MJPEG preview with device-enumerated resolution/FPS; OBS/video calls capture directly |
 | USB control link | Standard CDC NCM | USB DHCP address discovered automatically |
 | Image/exposure/WB/focus | Vendor TCP protobuf | Readable settings verified; face ROI command is blocked |
 | Exposure compensation | Command 15 | Auto exposure, unlocked; native 0…16, neutral 8; GUI displays −8…+8 |
@@ -16,6 +16,7 @@ been tested, and its firmware updater accepts only the S3 `ch131b` model.
 | Eight-colour HSL | Commands 118/128 | Three axes, enable switch, native string wire values |
 | Colour profiles | Commands 50/53 | IDs/styles, independent SDR/HDR profile banks |
 | Manual focus readback | Command 111 | Manual mode is required for lens positioning |
+| Interactive focus targets | Command 24 | Verified S3 1.0.4/build 1349 only; AF-S/AF-C movement, normalized rectangle readback |
 | LUT grading | Commands 94–96 | 5,508 packed 30-bit entries, no byte-RGB substitution |
 | Firmware updates | Commands 2/3/28 | Official package validation; upload/commit/reboot tested with simulated cameras, physical Rust flashing unvalidated |
 
@@ -40,6 +41,35 @@ Colour profile selection preserves the current HDR state and selects the
 corresponding bank; it does not download colour profile packages. Existing
 installed profiles can be selected. Audio/HDMI settings depend on capabilities
 reported by the connected camera and optional hardware.
+
+HDR is limited to 30 fps or lower in camera/preview compatibility checks.
+Preview modes come from actual MJPEG V4L2 resolution and interval enumeration;
+the default is 1280×720 at 30 fps. Capture selection does not write the shared
+camera frame-rate command (5). The UI checks the selected preview interval
+alongside the camera's native frame-rate readback: UVC negotiation itself can
+update that readback, so the app refreshes camera values after starting capture.
+If an older camera
+does not report a meaningful native frame rate, HDR shows an advisory rather
+than inventing a rate; high-FPS preview requires a known compatible HDR state.
+
+Presets are checked against current readbacks before settings writes. This
+includes HDR/frame-rate combinations, exposure/WB/focus modes, available
+capabilities, firmware-specific sharpness/crop support and the profile's HDR
+bank. A valid preset changes only specified values; HDR is disabled before
+raising native FPS, and native FPS is lowered before enabling HDR.
+Exposure-compensation presets also require a fresh, valid exposure-lock
+readback before any settings writes. Profile scene bounds are checked when
+the camera's available metadata describes the requested profile and bank.
+The camera still validates other installed profile IDs/scenes when selected;
+a later device or transport rejection can leave earlier preset changes applied.
+
+Focus targets preserve the current size reported by the camera. AF-S accepts
+click positioning; AF-C additionally supports dragging the region. Geometry
+is normalized to the camera output, including its current electronic crop.
+The app accepts sensor-pixel rounding within 0.001 per edge, requires a valid
+post-write rectangle readback, and never automatically replays a lost focus
+write. Other firmware versions, Face mode and Manual mode remain disabled for
+interactive target movement. This capability is separate from command 214.
 
 Face detection ROI (214), previously labelled “Face exposure region”, is
 blocked before socket I/O. On the tested S3 firmware 1.0.4 its handler never

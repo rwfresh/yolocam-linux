@@ -124,3 +124,53 @@ error, and recovery buttons that respect firmware/reboot verification barriers.
 Formatting, Clippy with warnings denied and all **83 tests** passed. Firmware
 flashing remains unvalidated on physical hardware; this correction does not
 change or install camera firmware.
+
+## v0.2.0 compatible preview and focus
+
+Validated on 2026-10-12 with the same S3 on firmware 1.0.4/build 1349.
+All **130 tests** passed, with formatting checked and Clippy warnings denied.
+The automated regressions cover preset checks before settings writes, both
+HDR/frame-rate transition orders, missing/invalid exposure-lock capabilities,
+fractional V4L2 intervals, saved-mode migration, capture-release barriers,
+letterbox focus coordinates, one action per completed gesture, producer frame
+freshness, disconnected geometry and uncertain focus writes without replay.
+
+Actual MJPEG enumeration returned **10 modes**: 720p and 1080p at
+25/30/50/60 fps, and 4K at 25/30 fps. The optimized capture implementation
+decoded the requested dimensions at each tested mode and released capture
+between sessions:
+
+| Negotiated preview mode | Latest measured delivery rate |
+|---|---|
+| 1280×720 / 30 fps | 29.56 fps |
+| 1920×1080 / 60 fps | 60.73 fps |
+| 3840×2160 / 30 fps | 30.23 fps |
+| Restart at 1280×720 / 30 fps | 29.91 fps |
+
+These are short physical capture checks, with six-second observation windows
+after each mode's readback refresh. The delivery rate is a measured frame
+counter, separate from the negotiated interval. No camera images were saved.
+UVC negotiation changed the camera's native frame-rate readback to 60 at
+1080p/60 and back to 30 at 4K/30. The GUI queues a camera refresh after capture
+starts; it does not fabricate that value or send a frame-rate SET for a preview
+selection.
+
+On the physical camera, enabling HDR at native 60 fps was rejected with HDR
+remaining off. Requesting native 60 fps with HDR enabled was rejected with
+30 fps remaining selected. Incompatible HDR/FPS and profile-bank presets
+were rejected before changing contrast. Simulated-device tests additionally
+assert no settings writes occur and verify the valid transition order.
+
+Both AF-S and AF-C focus moves passed through the optimized app worker.
+Command 24's actual rectangle moved as requested, within the 0.001 per-edge
+sensor-rounding tolerance, and ordinary control commands remained healthy
+after each move. The camera retained different actual region sizes in the two
+modes; the app preserved the readback rather than guessing from the area level.
+This verifies focus-region positioning, not subject sharpness or completion
+of autofocus. Support remains restricted to this verified model/version/build.
+
+Cleanup restored the original focus mode/area/rectangle, HDR/frame rate and
+colour profile. A complete before/after readback comparison found no changes
+to scalar settings, crop, HSL, WB offsets, camera presets or profile selection;
+the final heartbeat passed. No firmware was flashed, no camera daemon was
+restarted and command 214 remained blocked.

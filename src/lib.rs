@@ -7,8 +7,10 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/tv.yunxi.protobuf.rs"));
 }
 pub mod camera;
+pub mod compatibility;
 pub mod discovery;
 pub mod firmware;
+pub mod focus;
 pub mod gui;
 pub mod preview;
 pub mod protocol;

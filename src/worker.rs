@@ -21,7 +21,9 @@ use std::{
 
 use crate::{
     camera::{Camera, CameraState, CameraVersion, Crop, HslState},
+    compatibility::PresetPlan,
     firmware::{self, FirmwareRelease, VerifiedFirmware},
+    focus::FocusTarget,
     settings::{self, Preset},
 };
 
@@ -34,6 +36,7 @@ pub enum Command {
         value: i32,
     },
     SetCrop(Crop),
+    SetFocusTarget(FocusTarget),
     SetHslField {
         component: usize,
         colour: usize,
@@ -73,6 +76,7 @@ pub enum Event {
     Connection(bool),
     ConnectionError(String),
     State(Box<CameraState>),
+    FocusTargetApplied(FocusTarget),
     Status { message: String, error: bool },
     Busy(bool),
     FirmwareRelease(Box<FirmwareRelease>),
@@ -91,6 +95,22 @@ pub struct Worker {
 }
 
 impl Worker {
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, Receiver<Command>, Sender<Event>) {
+        let (tx, commands) = mpsc::channel();
+        let (events, rx) = mpsc::channel();
+        (
+            Self {
+                tx,
+                rx,
+                busy: Arc::new(AtomicBool::new(false)),
+                join: None,
+            },
+            commands,
+            events,
+        )
+    }
+
     pub fn new(ip: Option<Ipv4Addr>, port: u16) -> Self {
         let (tx, commands) = mpsc::channel();
         let (events, rx) = mpsc::channel();
@@ -604,6 +624,9 @@ fn run_worker(
             | Command::SelectProfile { .. } => {
                 absolute_with_recovery(&mut camera, &command, &events)
             }
+            Command::SetFocusTarget(target) => camera.set_focus_target(*target).map(|actual| {
+                let _ = events.send(Event::FocusTargetApplied(actual));
+            }),
             Command::SaveCrop(slot) => camera
                 .save_crop(*slot)
                 .and_then(|()| camera.refresh().map(|_| ())),
@@ -632,6 +655,7 @@ fn run_worker(
                     }
                     Command::SaveCrop(_) => "Crop preset saved on the camera",
                     Command::RecallCrop(_) => "Camera crop preset recalled",
+                    Command::SetFocusTarget(_) => "Camera focus region applied and read back",
                     Command::SetParam { ref key, .. }
                         if !crate::camera::param_specs()
                             .iter()
@@ -671,20 +695,26 @@ fn run_worker(
 
 fn apply_preset(camera: &mut Camera, preset: &Preset, events: &Sender<Event>) -> Result<()> {
     let preset = preset.normalized();
-    preset.validate()?;
-    if preset.values.contains_key("exposure-ev")
-        && preset
-            .values
-            .get("exposure-mode")
-            .or_else(|| camera.state.values.get("exposure-mode"))
-            != Some(&0)
-    {
-        bail!("Preset exposure compensation requires Auto exposure mode");
+    // Validate the full intended state before changing any camera settings.
+    // Fresh controlling readbacks prevent a stale GUI snapshot from approving
+    // incompatible HDR/frame-rate, mode or profile-bank combinations.
+    let plan = camera.prepare_preset(&preset)?;
+    for advisory in &plan.advisories {
+        status(events, advisory, false);
     }
     // Set the controlling modes first, then their dependent values. Applying a
     // preset is deliberate and stops at the first rejected or failed write.
-    for key in ["hdr", "exposure-mode", "wb-mode", "focus-mode"] {
-        if let Some(value) = preset.values.get(key) {
+    for key in &plan.ordered_keys {
+        if [
+            "hdr",
+            "frame-rate",
+            "exposure-mode",
+            "wb-mode",
+            "focus-mode",
+        ]
+        .contains(&key.as_str())
+            && let Some(value) = preset.values.get(key)
+        {
             status(
                 events,
                 format!("Applying preset {}: {key}", preset.name),
@@ -693,7 +723,7 @@ fn apply_preset(camera: &mut Camera, preset: &Preset, events: &Sender<Event>) ->
             perform_absolute(
                 camera,
                 &Command::SetParam {
-                    key: key.to_owned(),
+                    key: key.clone(),
                     value: *value,
                 },
             )?;
@@ -725,7 +755,7 @@ fn apply_preset(camera: &mut Camera, preset: &Preset, events: &Sender<Event>) ->
             lock_change_requested = true;
             write_exposure_lock(camera, 0, events)?;
         }
-        apply_preset_values(camera, &preset, events)?;
+        apply_preset_values(camera, &preset, &plan, events)?;
         if let Some(value) = desired_lock
             && camera.state.values.get("exposure-lock") != Some(&value)
         {
@@ -766,7 +796,12 @@ fn write_exposure_lock(camera: &mut Camera, value: i32, events: &Sender<Event>) 
     )
 }
 
-fn apply_preset_values(camera: &mut Camera, preset: &Preset, events: &Sender<Event>) -> Result<()> {
+fn apply_preset_values(
+    camera: &mut Camera,
+    preset: &Preset,
+    plan: &PresetPlan,
+    events: &Sender<Event>,
+) -> Result<()> {
     if let Some(value) = preset.values.get("exposure-ev") {
         status(
             events,
@@ -781,9 +816,10 @@ fn apply_preset_values(camera: &mut Camera, preset: &Preset, events: &Sender<Eve
             },
         )?;
     }
-    for (key, value) in &preset.values {
+    for key in &plan.ordered_keys {
         if [
             "hdr",
+            "frame-rate",
             "exposure-mode",
             "wb-mode",
             "focus-mode",
@@ -794,6 +830,10 @@ fn apply_preset_values(camera: &mut Camera, preset: &Preset, events: &Sender<Eve
         {
             continue;
         }
+        let value = preset
+            .values
+            .get(key)
+            .context("Preset plan contains an unknown key")?;
         if key == "focus-manual" && camera.state.values.get("focus-mode") != Some(&2) {
             bail!("Preset manual focus requires manual focus mode");
         }
@@ -1225,6 +1265,111 @@ mod tests {
         )));
         assert_eq!(fixture.values.lock().unwrap().get(&106), Some(&0));
         camera.disconnect();
+    }
+
+    fn video_preset_fixture(hdr: u32, fps: u32) -> (ExposureFixture, Camera) {
+        let fixture = ExposureFixture::new(None, false);
+        fixture.values.lock().unwrap().extend([(98, hdr), (5, fps)]);
+        let mut camera = fixture.camera();
+        camera.get_param("hdr").unwrap();
+        camera.get_param("frame-rate").unwrap();
+        (fixture, camera)
+    }
+
+    #[test]
+    fn incompatible_video_preset_is_rejected_before_any_settings_write() {
+        let (fixture, mut camera) = video_preset_fixture(0, 30);
+        let mut preset = Preset::capture("Invalid HDR", &camera.state).unwrap();
+        preset.values = BTreeMap::from([
+            ("contrast".to_owned(), 55),
+            ("hdr".to_owned(), 1),
+            ("frame-rate".to_owned(), 60),
+        ]);
+        let (events, _) = mpsc::channel();
+        let error = apply_preset(&mut camera, &preset, &events).unwrap_err();
+        assert!(error.to_string().contains("30 fps"), "{error:#}");
+        assert!(fixture.writes().is_empty());
+        assert_eq!(fixture.values.lock().unwrap().get(&98), Some(&0));
+        assert_eq!(fixture.values.lock().unwrap().get(&5), Some(&30));
+        assert_eq!(fixture.values.lock().unwrap().get(&9), Some(&48));
+        camera.disconnect();
+    }
+
+    #[test]
+    fn incompatible_profile_bank_is_rejected_before_ev_unlock_or_colour_changes() {
+        let (fixture, mut camera) = video_preset_fixture(0, 30);
+        camera.state.profile = Some(crate::pb::TuningParam {
+            id: 0,
+            scene_id: 0,
+            hdr_flag: 0,
+        });
+        let mut preset = Preset::capture("Wrong bank", &camera.state).unwrap();
+        preset.values =
+            BTreeMap::from([("contrast".to_owned(), 55), ("exposure-ev".to_owned(), 12)]);
+        preset.profile.as_mut().unwrap().hdr_flag = 1;
+        let (events, _) = mpsc::channel();
+        let error = apply_preset(&mut camera, &preset, &events).unwrap_err();
+        assert!(error.to_string().contains("HDR bank"), "{error:#}");
+        assert!(fixture.writes().is_empty());
+        assert_eq!(fixture.values.lock().unwrap().get(&106), Some(&1));
+        assert_eq!(fixture.values.lock().unwrap().get(&15), Some(&16));
+        assert_eq!(fixture.values.lock().unwrap().get(&9), Some(&48));
+        camera.disconnect();
+    }
+
+    #[test]
+    fn unreadable_or_invalid_ev_lock_prevents_earlier_hdr_and_colour_writes() {
+        for fresh_lock in [None, Some(2)] {
+            let (fixture, mut camera) = video_preset_fixture(0, 30);
+            let mut preset = Preset::capture("EV needs lock readback", &camera.state).unwrap();
+            preset.values = BTreeMap::from([
+                ("hdr".to_owned(), 1),
+                ("exposure-ev".to_owned(), 12),
+                ("contrast".to_owned(), 55),
+            ]);
+            // The GUI's cached lock remains valid; the fresh camera dependency
+            // disappeared or became invalid before the user applied the preset.
+            assert_eq!(camera.state.values.get("exposure-lock"), Some(&1));
+            {
+                let mut values = fixture.values.lock().unwrap();
+                match fresh_lock {
+                    Some(value) => {
+                        values.insert(106, value);
+                    }
+                    None => {
+                        values.remove(&106);
+                    }
+                }
+            }
+            let (events, _) = mpsc::channel();
+            assert!(apply_preset(&mut camera, &preset, &events).is_err());
+            assert!(fixture.writes().is_empty());
+            assert_eq!(fixture.values.lock().unwrap().get(&98), Some(&0));
+            assert_eq!(fixture.values.lock().unwrap().get(&15), Some(&16));
+            assert_eq!(fixture.values.lock().unwrap().get(&9), Some(&48));
+            camera.disconnect();
+        }
+    }
+
+    #[test]
+    fn valid_video_presets_apply_hdr_and_fps_in_a_compatible_order_once() {
+        for (initial_hdr, initial_fps, target_hdr, target_fps, expected) in [
+            (0, 60, 1, 30, vec![(5, 30), (98, 1)]),
+            (1, 30, 0, 60, vec![(98, 0), (5, 60)]),
+        ] {
+            let (fixture, mut camera) = video_preset_fixture(initial_hdr, initial_fps);
+            let mut preset = Preset::capture("Video mode", &camera.state).unwrap();
+            preset.values = BTreeMap::from([
+                ("hdr".to_owned(), target_hdr),
+                ("frame-rate".to_owned(), target_fps),
+            ]);
+            let (events, _) = mpsc::channel();
+            apply_preset(&mut camera, &preset, &events).unwrap();
+            assert_eq!(fixture.writes(), expected);
+            assert_eq!(camera.state.values.get("hdr"), Some(&target_hdr));
+            assert_eq!(camera.state.values.get("frame-rate"), Some(&target_fps));
+            camera.disconnect();
+        }
     }
 
     type ControlRequests = Vec<(i32, i32, Option<u32>)>;

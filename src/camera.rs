@@ -2,7 +2,7 @@
 // Protocol/control definitions based on yolocam-linux (Seth Hillbrand, 2026).
 //! Firmware-aware camera controls, with readback verification and UI units.
 
-use crate::{pb, protocol::Client};
+use crate::{compatibility, pb, protocol::Client, settings::Preset};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ pub struct CameraVersion {
 }
 
 impl CameraVersion {
-    fn semantic_version(&self) -> Option<(u32, u32, u32)> {
+    pub(crate) fn semantic_version(&self) -> Option<(u32, u32, u32)> {
         let version = self.firmware.rsplit('-').next().unwrap_or("");
         let parts: Option<Vec<u32>> = version.split('.').map(|part| part.parse().ok()).collect();
         parts
@@ -73,7 +73,7 @@ impl Crop {
             bottom: top + extent,
         })
     }
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let expected = Self::new(self.zoom, self.left, self.top)?;
         ensure!(
             self.right.is_finite()
@@ -123,7 +123,7 @@ pub struct HslState {
 }
 
 impl HslState {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.values
                 .iter()
@@ -207,6 +207,7 @@ pub struct CameraState {
     pub profile: Option<pb::TuningParam>,
     pub profile_info: Option<pb::TuningFileInfo>,
     pub wb_offsets: Option<(u32, u32)>,
+    pub focus_target: Option<crate::focus::FocusTarget>,
 }
 
 #[derive(Clone, Debug)]
@@ -795,6 +796,7 @@ impl Camera {
                     .insert("wb-offsets".into(), format!("{error:#}"));
             }
         }
+        self.refresh_focus_target();
         self.recover_probe()?;
         Ok(())
     }
@@ -841,6 +843,14 @@ impl Camera {
         } else {
             raw
         };
+        if key == "frame-rate" && !matches!(decoded, 25 | 30 | 50 | 60) {
+            self.state.values.remove(key);
+            let reason = format!(
+                "Camera frame-rate command did not expose a supported rate (CID5 returned {decoded}); use a V4L2 capture mode"
+            );
+            self.state.unsupported.insert(key.into(), reason.clone());
+            bail!("{reason}");
+        }
         self.state.values.insert(key.into(), decoded);
         self.state.unsupported.remove(key);
         Ok(decoded)
@@ -851,26 +861,9 @@ impl Camera {
             .iter()
             .find(|spec| spec.key == key)
             .context("unknown camera parameter")?;
-        if let Some(reason) = unsupported_control_reason(key) {
+        if let Some(reason) = compatibility::control_value_reason(&self.state, key, value) {
             bail!("{reason}");
         }
-        if let Some(reason) = self.state.unsupported.get(key) {
-            bail!("{key} is unavailable: {reason}");
-        }
-        let maximum = if key == "sharpness" && !self.uses_eptz() {
-            30
-        } else {
-            spec.max
-        };
-        ensure!(
-            (spec.min..=maximum).contains(&value),
-            "{key} must be between {} and {maximum}",
-            spec.min
-        );
-        ensure!(
-            spec.options.is_empty() || spec.options.iter().any(|(number, _)| *number == value),
-            "{value} is not a supported choice for {key}"
-        );
         if key == "exposure-ev" {
             // Check the device rather than trusting a cached GUI state. The
             // firmware accepts ineffective EV writes in Manual or locked Auto.
@@ -882,6 +875,30 @@ impl Camera {
                 self.get_param("exposure-lock")? == 0,
                 "Unlock Auto exposure before changing exposure compensation"
             );
+        }
+        match key {
+            "hdr" if value == 1 => self.refresh_optional_frame_rate()?,
+            "frame-rate" => {
+                // An integer ACK from a shared/stub command is insufficient
+                // evidence that it supports camera frame-rate changes.
+                self.get_param("frame-rate")?;
+                if value > 30 {
+                    self.refresh_hdr_bank()?;
+                }
+            }
+            "exposure-iso" | "exposure-time" | "exposure-aperture" | "exposure-lock" => {
+                self.get_param("exposure-mode")?;
+            }
+            "wb-temp" | "wb-temp-shift" | "wb-lock" => {
+                self.get_param("wb-mode")?;
+            }
+            "focus-manual" => {
+                self.get_param("focus-mode")?;
+            }
+            _ => {}
+        }
+        if let Some(reason) = compatibility::control_reason(&self.state, key, value) {
+            bail!("{reason}");
         }
         let wire_value = if key == "sharpness" && value < 0 {
             (60 - value) as u32
@@ -940,7 +957,107 @@ impl Camera {
         if key == "wb-mode" && value == 0 {
             self.state.wb_offsets = self.read_wb_offsets().ok();
         }
+        if matches!(key, "focus-mode" | "focus-level") {
+            self.refresh_focus_target();
+        }
         Ok(actual)
+    }
+
+    fn refresh_focus_target(&mut self) {
+        let supported = self
+            .state
+            .version
+            .as_ref()
+            .is_some_and(crate::focus::firmware_supported)
+            && matches!(self.state.values.get("focus-mode"), Some(1 | 3))
+            && matches!(self.state.values.get("focus-level"), Some(0..=2));
+        if !supported {
+            self.state.focus_target = None;
+            self.state.unsupported.remove("focus-target");
+            return;
+        }
+        // The optional read records its own error and clears stale geometry.
+        // A rejected GET must not change the result of an applied setting.
+        let _ = self.read_focus_target();
+    }
+
+    /// Unknown frame rate does not disable HDR on firmware whose shared CID5
+    /// is absent/stubbed. A failed probe must still leave a healthy transport.
+    fn refresh_optional_frame_rate(&mut self) -> Result<()> {
+        if self.state.unsupported.contains_key("frame-rate") {
+            return Ok(());
+        }
+        if let Err(error) = self.get_param("frame-rate") {
+            self.state.values.remove("frame-rate");
+            self.state
+                .unsupported
+                .insert("frame-rate".into(), format!("{error:#}"));
+            self.recover_probe()
+                .context("Camera did not recover after its unavailable frame-rate read")?;
+        }
+        Ok(())
+    }
+
+    fn refresh_hdr_bank(&mut self) -> Result<()> {
+        let single_sdr_bank = self
+            .state
+            .version
+            .as_ref()
+            .filter(|version| version.firmware.starts_with("YunxiCamera-ch131b-"))
+            .and_then(CameraVersion::semantic_version)
+            .is_some_and(|version| version < (1, 0, 4))
+            && self.state.unsupported.contains_key("hdr");
+        if !single_sdr_bank {
+            self.get_param("hdr")?;
+        }
+        Ok(())
+    }
+
+    /// Read controlling modes before producing a complete, side-effect-free
+    /// preset plan. This method sends no settings writes. The worker executes
+    /// the returned order while retaining its EV unlock/settle/relock cleanup.
+    pub fn prepare_preset(&mut self, preset: &Preset) -> Result<compatibility::PresetPlan> {
+        let preset = preset.normalized();
+        preset.validate()?;
+        for (key, value) in &preset.values {
+            if let Some(reason) = compatibility::control_value_reason(&self.state, key, *value) {
+                bail!("Preset {reason}");
+            }
+        }
+        let has = |keys: &[&str]| keys.iter().any(|key| preset.values.contains_key(*key));
+        if has(&["hdr", "frame-rate"]) || preset.profile.is_some() {
+            if preset.values.contains_key("hdr")
+                || preset.profile.is_some()
+                || preset.values.get("frame-rate").is_some_and(|fps| *fps > 30)
+            {
+                self.refresh_hdr_bank()?;
+            }
+            if preset.values.contains_key("frame-rate") {
+                self.get_param("frame-rate")?;
+            } else if preset.values.get("hdr") == Some(&1) || preset.profile.is_some() {
+                self.refresh_optional_frame_rate()?;
+            }
+        }
+        if has(&[
+            "exposure-mode",
+            "exposure-ev",
+            "exposure-lock",
+            "exposure-iso",
+            "exposure-time",
+            "exposure-aperture",
+        ]) {
+            self.get_param("exposure-mode")?;
+            if has(&["exposure-ev", "exposure-lock"]) {
+                self.get_param("exposure-lock")?;
+            }
+        }
+        if has(&["wb-mode", "wb-temp", "wb-temp-shift", "wb-lock"]) || preset.wb_offsets.is_some() {
+            self.get_param("wb-mode")?;
+        }
+        if has(&["focus-mode", "focus-manual"]) {
+            self.get_param("focus-mode")?;
+        }
+        compatibility::preset_plan(&self.state, &preset)
     }
 
     fn read_crop(&mut self) -> Result<Crop> {
@@ -951,6 +1068,9 @@ impl Camera {
     }
     pub fn set_crop(&mut self, crop: Crop) -> Result<Crop> {
         crop.validate()?;
+        if let Some(reason) = self.state.unsupported.get("eptz") {
+            bail!("Native ePTZ is unavailable: {reason}");
+        }
         ensure!(
             self.uses_eptz(),
             "native ePTZ requires S3 firmware 0.0.8 or later"
@@ -962,6 +1082,7 @@ impl Camera {
             crop.approximately_equal(&actual),
             "camera did not apply the requested crop"
         );
+        self.refresh_focus_target();
         Ok(actual)
     }
     fn read_hsl(&mut self) -> Result<HslState> {
@@ -972,6 +1093,9 @@ impl Camera {
     }
     pub fn set_hsl(&mut self, hsl: HslState) -> Result<HslState> {
         hsl.validate()?;
+        if let Some(reason) = self.state.unsupported.get("hsl") {
+            bail!("HSL is unavailable: {reason}");
+        }
         ensure!(self.uses_eptz(), "HSL requires S3 firmware 0.0.8 or later");
         accepted(self.client.set(118, Value::HslParam(hsl.to_pb()))?)?;
         let actual = self.read_hsl()?;
@@ -1116,6 +1240,13 @@ impl Camera {
             red <= 20 && blue <= 20,
             "white balance offsets must be between 0 and 20"
         );
+        if let Some(reason) = self.state.unsupported.get("wb-offsets") {
+            bail!("White-balance offsets are unavailable: {reason}");
+        }
+        ensure!(
+            self.get_param("wb-mode")? == 0,
+            "White-balance offsets require Manual white balance"
+        );
         accepted(self.client.set(
             33,
             Value::WhiteBalanceOffset(pb::WhiteBalanceOffset {
@@ -1176,6 +1307,320 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    type CompatibilityRequests = Vec<(i32, i32)>;
+
+    /// Only loopback TCP is used. Cached state deliberately stays at defaults
+    /// while the peer can return different dependency values.
+    fn compatibility_camera(
+        actual: &[(i32, u32)],
+    ) -> (Camera, thread::JoinHandle<CompatibilityRequests>) {
+        let defaults = BTreeMap::from([
+            (5, 30),
+            (9, 48),
+            (14, 0),
+            (15, 8),
+            (17, 100),
+            (18, 16666),
+            (20, 7),
+            (21, 1),
+            (22, 5600),
+            (23, 3),
+            (38, 0),
+            (98, 0),
+            (104, 0),
+            (105, 64),
+            (106, 0),
+            (111, 30),
+        ]);
+        let mut wire_values = defaults.clone();
+        for &(id, value) in actual {
+            if value == u32::MAX {
+                wire_values.remove(&id); // Simulate an absent firmware module.
+            } else {
+                wire_values.insert(id, value);
+            }
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut requests = Vec::new();
+            loop {
+                let mut header = [0; 8];
+                if stream.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+                assert!(length <= crate::protocol::MAX_PAYLOAD_SIZE + 8);
+                let mut frame = header.to_vec();
+                frame.resize(8 + length, 0);
+                stream.read_exact(&mut frame[8..]).unwrap();
+                let request =
+                    pb::Message::decode(crate::protocol::unpack_frame(&frame).unwrap().as_slice())
+                        .unwrap();
+                requests.push((request.r#type, request.id));
+                let value = if request.r#type == 2 {
+                    let Some(Value::IntVal(value)) =
+                        request.body.as_ref().and_then(|body| body.value.as_ref())
+                    else {
+                        panic!("Unexpected compound write in compatibility fixture");
+                    };
+                    if request.id != 215 {
+                        wire_values.insert(request.id, *value);
+                    }
+                    Some(Value::IntVal(*value))
+                } else {
+                    match request.id {
+                        53 => Some(Value::TuningParam(pb::TuningParam {
+                            hdr_flag: wire_values[&98],
+                            ..Default::default()
+                        })),
+                        50 => Some(Value::TuningFileInfo(pb::TuningFileInfo {
+                            scene_count: 1,
+                            ..Default::default()
+                        })),
+                        33 => Some(Value::WhiteBalanceOffset(pb::WhiteBalanceOffset {
+                            offset_r: 10,
+                            offset_b: 10,
+                        })),
+                        id => wire_values.get(&id).copied().map(Value::IntVal),
+                    }
+                };
+                let response = pb::Message {
+                    r#type: 4,
+                    seq: request.seq,
+                    id: request.id,
+                    resp_code: if value.is_some() { 200 } else { 100 },
+                    body: value.map(|value| pb::CommandBody { value: Some(value) }),
+                    ..Default::default()
+                };
+                stream
+                    .write_all(&crate::protocol::pack_frame(&response.encode_to_vec()))
+                    .unwrap();
+            }
+            requests
+        });
+        let mut camera = Camera::new(Some(Ipv4Addr::LOCALHOST), port, Duration::from_millis(500));
+        camera.state.version = Some(CameraVersion {
+            firmware: "YunxiCamera-ch131b-1.0.4".into(),
+            build: 1349,
+            ..Default::default()
+        });
+        for spec in param_specs() {
+            if let Some(value) = defaults.get(&(spec.cid as i32)) {
+                camera
+                    .state
+                    .values
+                    .insert(spec.key.to_owned(), *value as i32);
+            }
+        }
+        camera.state.profile = Some(pb::TuningParam::default());
+        camera.state.wb_offsets = Some((10, 10));
+        camera.client.connect().unwrap();
+        (camera, peer)
+    }
+
+    fn setting_writes(requests: &CompatibilityRequests) -> Vec<i32> {
+        requests
+            .iter()
+            .filter_map(|(kind, id)| (*kind == 2 && *id != 215).then_some(*id))
+            .collect()
+    }
+
+    fn compatibility_preset(values: &[(&str, i32)]) -> Preset {
+        Preset {
+            schema_version: 1,
+            name: "Mock compatibility".into(),
+            values: values
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), *value))
+                .collect(),
+            crop: None,
+            hsl: None,
+            profile: None,
+            wb_offsets: None,
+            omitted_controls: Default::default(),
+        }
+    }
+
+    #[test]
+    fn hdr_and_high_fps_writes_use_fresh_camera_dependencies() {
+        for (key, value, actual, cached_key, cached_value, expected_write) in [
+            ("hdr", 1, (5, 60), "frame-rate", 30, None),
+            ("hdr", 1, (5, 30), "frame-rate", 60, Some(98)),
+            ("frame-rate", 60, (98, 1), "hdr", 0, None),
+            ("frame-rate", 60, (98, 0), "hdr", 1, Some(5)),
+        ] {
+            let (mut camera, peer) = compatibility_camera(&[actual]);
+            camera.state.values.insert(cached_key.into(), cached_value);
+            let result = camera.set_param(key, value);
+            assert_eq!(
+                result.is_ok(),
+                expected_write.is_some(),
+                "{key}: {result:?}"
+            );
+            if expected_write.is_none() {
+                assert!(result.unwrap_err().to_string().contains("HDR"));
+            }
+            camera.disconnect();
+            let requests = peer.join().unwrap();
+            assert_eq!(
+                setting_writes(&requests),
+                expected_write.into_iter().collect::<Vec<_>>()
+            );
+            assert!(requests.contains(&(1, 5)));
+            if key == "frame-rate" {
+                assert!(requests.contains(&(1, 98)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_stub_frame_rate_is_not_invented_and_is_not_repeatedly_probed_for_hdr() {
+        for unavailable in [0, u32::MAX] {
+            let (mut camera, peer) = compatibility_camera(&[(5, unavailable)]);
+            assert_eq!(camera.set_param("hdr", 1).unwrap(), 1);
+            assert!(!camera.state.values.contains_key("frame-rate"));
+            assert!(camera.state.unsupported.contains_key("frame-rate"));
+            assert!(
+                compatibility::hdr_fps_check(Some(1), compatibility::camera_fps(&camera.state))
+                    .advisory
+                    .is_some()
+            );
+            assert_eq!(camera.set_param("hdr", 0).unwrap(), 0);
+            assert_eq!(camera.set_param("hdr", 1).unwrap(), 1);
+            assert!(camera.set_param("frame-rate", 30).is_err());
+            camera.disconnect();
+            let requests = peer.join().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| **request == (1, 5))
+                    .count(),
+                1
+            );
+            assert_eq!(setting_writes(&requests), [98, 98, 98]);
+        }
+    }
+
+    #[test]
+    fn unsupported_hdr_prevents_high_fps_writes_except_the_known_legacy_sdr_bank() {
+        for unavailable in [2, u32::MAX] {
+            let (mut camera, peer) = compatibility_camera(&[(98, unavailable)]);
+            camera.state.values.insert("hdr".into(), 0);
+            assert!(camera.set_param("frame-rate", 60).is_err());
+            camera.disconnect();
+            assert!(setting_writes(&peer.join().unwrap()).is_empty());
+        }
+
+        let (mut camera, peer) = compatibility_camera(&[(98, u32::MAX)]);
+        camera.state.version.as_mut().unwrap().firmware = "OtherCamera-othermodel-0.0.7".into();
+        camera.state.values.remove("hdr");
+        camera
+            .state
+            .unsupported
+            .insert("hdr".into(), "absent".into());
+        assert!(camera.set_param("frame-rate", 60).is_err());
+        camera.disconnect();
+        let requests = peer.join().unwrap();
+        assert!(requests.contains(&(1, 98)));
+        assert!(setting_writes(&requests).is_empty());
+
+        let (mut camera, peer) = compatibility_camera(&[]);
+        camera.state.version.as_mut().unwrap().firmware = "YunxiCamera-ch131b-0.0.7".into();
+        camera
+            .state
+            .unsupported
+            .insert("hdr".into(), "absent before HDR firmware".into());
+        assert_eq!(camera.set_param("frame-rate", 60).unwrap(), 60);
+        camera.disconnect();
+        let requests = peer.join().unwrap();
+        assert!(!requests.contains(&(1, 98)));
+        assert_eq!(setting_writes(&requests), [5]);
+    }
+
+    #[test]
+    fn lower_frame_rates_remain_available_when_modern_hdr_is_unreadable() {
+        let (mut camera, peer) = compatibility_camera(&[(98, u32::MAX)]);
+        camera.state.values.remove("hdr");
+        camera
+            .state
+            .unsupported
+            .insert("hdr".into(), "unreadable".into());
+        let preset = compatibility_preset(&[("frame-rate", 30)]);
+        assert_eq!(
+            camera.prepare_preset(&preset).unwrap().ordered_keys,
+            ["frame-rate"]
+        );
+        assert_eq!(camera.set_param("frame-rate", 30).unwrap(), 30);
+        camera.disconnect();
+        let requests = peer.join().unwrap();
+        assert!(!requests.contains(&(1, 98)));
+        assert_eq!(setting_writes(&requests), [5]);
+    }
+
+    #[test]
+    fn manual_control_writes_check_actual_modes_instead_of_gui_cache() {
+        for (key, value, actual, mode_key, stale, cid) in [
+            ("exposure-iso", 400, (14, 0), "exposure-mode", 1, 17),
+            ("wb-temp", 6500, (21, 1), "wb-mode", 0, 22),
+            ("focus-manual", 40, (23, 3), "focus-mode", 2, 111),
+        ] {
+            let (mut camera, peer) = compatibility_camera(&[actual]);
+            camera.state.values.insert(mode_key.into(), stale);
+            assert!(camera.set_param(key, value).is_err());
+            camera.disconnect();
+            let requests = peer.join().unwrap();
+            assert!(requests.contains(&(1, actual.0)));
+            assert!(!requests.contains(&(2, cid)));
+            assert!(setting_writes(&requests).is_empty());
+        }
+        let (mut camera, peer) = compatibility_camera(&[(21, 1)]);
+        camera.state.values.insert("wb-mode".into(), 0);
+        assert!(camera.set_wb_offsets(12, 9).is_err());
+        camera.disconnect();
+        assert!(setting_writes(&peer.join().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn fresh_preset_preflight_rejects_bad_later_controls_without_any_settings_writes() {
+        for (actual, preset) in [
+            (
+                vec![],
+                compatibility_preset(&[("contrast", 55), ("hdr", 1), ("frame-rate", 60)]),
+            ),
+            (
+                vec![(14, 1)],
+                compatibility_preset(&[("contrast", 55), ("exposure-ev", 12)]),
+            ),
+            (
+                vec![(21, 1)],
+                compatibility_preset(&[("contrast", 55), ("wb-temp", 6500)]),
+            ),
+            (
+                vec![(23, 3)],
+                compatibility_preset(&[("contrast", 55), ("focus-manual", 40)]),
+            ),
+        ] {
+            let (mut camera, peer) = compatibility_camera(&actual);
+            camera.state.values.insert("exposure-mode".into(), 0);
+            camera.state.values.insert("wb-mode".into(), 0);
+            camera.state.values.insert("focus-mode".into(), 2);
+            assert!(camera.prepare_preset(&preset).is_err());
+            camera.disconnect();
+            assert!(setting_writes(&peer.join().unwrap()).is_empty());
+        }
+        let (mut camera, peer) = compatibility_camera(&[(5, 60)]);
+        let preset = compatibility_preset(&[("hdr", 1), ("frame-rate", 30)]);
+        let plan = camera.prepare_preset(&preset).unwrap();
+        assert_eq!(plan.ordered_keys, ["frame-rate", "hdr"]);
+        camera.disconnect();
+        assert!(setting_writes(&peer.join().unwrap()).is_empty());
+    }
 
     #[test]
     fn legacy_brightness_cannot_read_or_write_a_misleading_firmware_value() {

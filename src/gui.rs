@@ -3,7 +3,14 @@
 
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextureHandle, Vec2};
-use std::{collections::BTreeMap, net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::Ipv4Addr,
+    path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::{
     camera::{
@@ -11,7 +18,8 @@ use crate::{
         unsupported_control_reason,
     },
     firmware::FirmwareRelease,
-    preview::Preview,
+    focus::{self, FocusTarget},
+    preview::{self, Preview, PreviewCapabilities, PreviewFrame, PreviewMode},
     settings::{Preset, Settings, Store},
     worker::{Command, Event, PreparedSummary, Worker},
 };
@@ -117,10 +125,19 @@ struct App {
     desired_wb: Option<(u32, u32)>,
     preview: Preview,
     preview_attempted: bool,
+    preview_capabilities: Option<PreviewCapabilities>,
+    preview_probe: Option<mpsc::Receiver<std::result::Result<PreviewCapabilities, String>>>,
+    preview_probe_started: Option<Instant>,
+    preview_probe_attempted: bool,
+    preview_error: Option<String>,
     texture: Option<TextureHandle>,
     frame_sequence: u64,
     frame_dimensions: (usize, usize),
     frame_fps: f32,
+    frame_captured_at: Option<Instant>,
+    focus_draft: Option<FocusTarget>,
+    focus_drag_armed: bool,
+    focus_pending: bool,
     crop_slot: u8,
     release: Option<FirmwareRelease>,
     prepared: Option<PreparedSummary>,
@@ -202,10 +219,19 @@ impl App {
             desired_wb: None,
             preview: Preview::new(),
             preview_attempted: false,
+            preview_capabilities: demo.then(demo_preview_capabilities),
+            preview_probe: None,
+            preview_probe_started: None,
+            preview_probe_attempted: demo,
+            preview_error: None,
             texture: None,
             frame_sequence: 0,
             frame_dimensions: (0, 0),
             frame_fps: 0.0,
+            frame_captured_at: None,
+            focus_draft: None,
+            focus_drag_armed: false,
+            focus_pending: false,
             crop_slot: 0,
             release: None,
             prepared: None,
@@ -297,12 +323,24 @@ impl App {
     }
 
     fn send(&mut self, command: Command) -> bool {
+        let reason = match &command {
+            Command::SetParam { key, value } if key == "hdr" || key == "frame-rate" => {
+                self.requested_control_reason(key, *value)
+            }
+            Command::ApplyPreset(preset) => self.preset_reason(preset),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.error(reason);
+            return false;
+        }
         if self.demo {
             match command {
                 Command::SetParam { key, value } => {
                     self.state.values.insert(key, value);
                 }
                 Command::SetCrop(crop) => self.state.eptz = Some(crop),
+                Command::SetFocusTarget(target) => self.state.focus_target = Some(target),
                 Command::SetHslField {
                     component,
                     colour,
@@ -341,6 +379,19 @@ impl App {
         );
         let clear_crop = clear_all || matches!(command, Command::RecallCrop(_));
         let clear_hsl = clear_all || matches!(command, Command::ResetHsl);
+        let pending_preset = if let Command::ApplyPreset(preset) = &command {
+            Some((
+                preset
+                    .values
+                    .iter()
+                    .filter(|(key, _)| ["hdr", "focus-mode", "focus-level"].contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<BTreeMap<_, _>>(),
+                preset.crop.clone(),
+            ))
+        } else {
+            None
+        };
         let result = self
             .worker
             .as_ref()
@@ -357,6 +408,10 @@ impl App {
                 }
                 if clear_hsl {
                     self.desired_hsl.clear();
+                }
+                if let Some((values, crop)) = pending_preset {
+                    self.desired.extend(values);
+                    self.desired_crop = crop;
                 }
                 self.status = "Sending control to camera…".to_owned();
                 self.status_error = false;
@@ -382,12 +437,20 @@ impl App {
                 self.connected = connected;
                 if connected {
                     self.control_connection_error = None;
+                } else {
+                    self.state.focus_target = None;
+                    self.focus_pending = false;
+                    self.focus_draft = None;
+                    self.focus_drag_armed = false;
                 }
             }
             Event::ConnectionError(message) => {
                 self.control_connection_error = Some(message);
             }
-            Event::State(state) => {
+            Event::State(mut state) => {
+                if !self.connected {
+                    state.focus_target = None;
+                }
                 self.desired
                     .retain(|key, value| state.values.get(key) != Some(value));
                 self.desired_hsl.retain(|(axis, colour), value| {
@@ -417,7 +480,15 @@ impl App {
                     self.desired_hsl.clear();
                     self.desired_crop = None;
                     self.desired_wb = None;
+                    self.focus_pending = false;
+                    self.focus_draft = None;
+                    self.focus_drag_armed = false;
                 }
+            }
+            Event::FocusTargetApplied(target) => {
+                self.state.focus_target = Some(target);
+                self.focus_pending = false;
+                self.focus_draft = None;
             }
             Event::Busy(busy) => self.busy = busy,
             Event::FirmwareRelease(release) => {
@@ -446,6 +517,9 @@ impl App {
                 self.prepared = None;
                 self.firmware_phase = "verified".to_owned();
                 self.firmware_percent = 100;
+                self.preview_capabilities = None;
+                self.preview_probe_attempted = false;
+                self.preview_error = None;
                 if self.restore_preview_after_update {
                     self.preview_attempted = false;
                 }
@@ -483,7 +557,7 @@ impl App {
     }
 
     fn toggle_preview(&mut self) {
-        if self.installing || self.uncertain_update {
+        if self.busy || self.installing || self.uncertain_update {
             return;
         }
         self.settings.preview_enabled = !self.settings.preview_enabled;
@@ -491,42 +565,206 @@ impl App {
         if !self.settings.preview_enabled {
             self.preview.stop();
             self.texture = None;
+            self.frame_captured_at = None;
+            self.focus_draft = None;
+            self.focus_drag_armed = false;
         }
         self.save_preferences();
+    }
+
+    fn requested_control_reason(&self, key: &str, value: i32) -> Option<String> {
+        crate::compatibility::control_reason(&self.state, key, value).or_else(|| {
+            (key == "hdr"
+                && value == 1
+                && crate::compatibility::exceeds_hdr_limit(self.settings.preview_mode.fps()))
+            .then(|| "Select a preview mode at 30 fps or lower before enabling HDR".to_owned())
+        })
+    }
+
+    fn preset_reason(&self, preset: &Preset) -> Option<String> {
+        match crate::compatibility::preset_plan(&self.state, preset) {
+            Err(error) => Some(error.to_string()),
+            Ok(plan) => (plan.target_hdr == Some(1)
+                && crate::compatibility::exceeds_hdr_limit(self.settings.preview_mode.fps()))
+            .then(|| {
+                "Select a preview mode at 30 fps or lower before applying an HDR preset".to_owned()
+            }),
+        }
+    }
+
+    fn refresh_preview_modes(&mut self) {
+        if self.demo
+            || self.busy
+            || self.installing
+            || self.uncertain_update
+            || self.preview_probe.is_some()
+        {
+            return;
+        }
+        self.preview_capabilities = None;
+        self.preview_probe_attempted = true;
+        self.preview_error = None;
+        self.preview_probe_started = Some(Instant::now());
+        let device = self.settings.preview_device.clone();
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("video-modes".to_owned())
+            .spawn(move || {
+                let result = preview::enumerate(device).map_err(|error| format!("{error:#}"));
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => self.preview_probe = Some(receiver),
+            Err(error) => self.preview_error = Some(format!("Cannot inspect video modes: {error}")),
+        }
+    }
+
+    fn select_preview_mode(&mut self, mode: PreviewMode) {
+        let reason = self.preview_choice_reason(self.preview_capabilities.as_ref(), mode);
+        if let Some(reason) = reason {
+            self.preview_error = Some(reason);
+            return;
+        }
+        if self.settings.preview_mode != mode {
+            self.preview.stop();
+            self.texture = None;
+            self.frame_sequence = 0;
+            self.frame_captured_at = None;
+            self.focus_draft = None;
+            self.focus_drag_armed = false;
+            self.settings.preview_mode = mode;
+            self.preview_attempted = false;
+            self.preview_error = None;
+            self.save_preferences();
+        }
+    }
+
+    fn preview_choice_reason(
+        &self,
+        capabilities: Option<&PreviewCapabilities>,
+        mode: PreviewMode,
+    ) -> Option<String> {
+        preview_mode_reason(&self.state, capabilities, mode).or_else(|| {
+            (crate::compatibility::exceeds_hdr_limit(mode.fps())
+                && self.desired.get("hdr") == Some(&1))
+            .then(|| {
+                "Wait for the pending HDR change; preview above 30 fps requires confirmed SDR"
+                    .to_owned()
+            })
+        })
     }
 
     fn update_preview(&mut self, ctx: &egui::Context) {
         if self.demo || self.installing || self.uncertain_update {
             return;
         }
-        if self.settings.preview_enabled && self.connected && !self.preview_attempted {
-            self.preview_attempted = true;
-            if let Err(error) = self.preview.start(self.settings.preview_device.clone()) {
-                self.error(format!("Preview: {error:#}"));
+        if !self.preview_probe_attempted && !self.busy {
+            self.refresh_preview_modes();
+        }
+        if let Some(receiver) = &self.preview_probe {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "Video mode inspection stopped unexpectedly. Refresh video modes to retry."
+                        .to_owned(),
+                )),
+                Err(mpsc::TryRecvError::Empty)
+                    if self
+                        .preview_probe_started
+                        .is_some_and(|started| started.elapsed() > Duration::from_secs(5)) =>
+                {
+                    self.preview_error = Some("Video mode inspection timed out. Check USB; waiting for the device to release its inspection session.".to_owned());
+                    None
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                self.preview_probe = None;
+                self.preview_probe_started = None;
+                match result {
+                    Ok(capabilities) => {
+                        self.preview_capabilities = Some(capabilities);
+                        self.preview_attempted = false;
+                    }
+                    Err(reason) => self.preview_error = Some(reason),
+                }
             }
+        }
+        let mode_reason = self.preview_choice_reason(
+            self.preview_capabilities.as_ref(),
+            self.settings.preview_mode,
+        );
+        if self.preview.is_running() && mode_reason.is_some() {
+            self.preview.stop();
+            self.texture = None;
+            self.frame_captured_at = None;
+            self.preview_error = None;
+            self.preview_attempted = false;
+        }
+        if self.settings.preview_enabled
+            && self.connected
+            && !self.busy
+            && self.preview_capabilities.is_some()
+            && mode_reason.is_none()
+            && !self.preview_attempted
+        {
+            self.preview_attempted = true;
+            let device = self
+                .preview_capabilities
+                .as_ref()
+                .map(|capabilities| capabilities.device.clone());
+            let result = self.preview.start_mode(device, self.settings.preview_mode);
+            self.handle_preview_start(result);
         }
         if let Some(error) = self.preview.error() {
             if self.preview.is_running() {
                 self.preview.stop();
             }
-            let text = format!("Preview: {error}");
-            if self.status != text {
-                self.error(text);
-            }
+            self.preview_error = Some(format!("Preview: {error}"));
+            self.frame_captured_at = None;
+            self.focus_draft = None;
+            self.focus_drag_armed = false;
         }
-        if let Some(frame) = self.preview.latest()
+        if self.preview.is_running()
+            && let Some(frame) = self.preview.latest_since(self.frame_sequence)
             && frame.sequence != self.frame_sequence
         {
-            self.frame_sequence = frame.sequence;
-            self.frame_dimensions = (frame.width, frame.height);
-            self.frame_fps = frame.fps;
-            let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
-            if let Some(texture) = &mut self.texture {
-                texture.set(image, egui::TextureOptions::LINEAR);
-            } else {
-                self.texture =
-                    Some(ctx.load_texture("yolocam-live", image, egui::TextureOptions::LINEAR));
+            self.display_preview_frame(ctx, frame);
+        }
+    }
+
+    fn handle_preview_start(&mut self, result: Result<()>) {
+        self.preview_attempted = true;
+        match result {
+            Ok(()) => {
+                // Starting UVC capture can change CID5 inside the camera.
+                // Read its actual FPS/HDR/focus once after negotiation. Direct
+                // enqueueing preserves pending edits that send(Refresh) clears.
+                let refresh = self
+                    .worker
+                    .as_ref()
+                    .context("Camera worker is unavailable")
+                    .and_then(|worker| worker.send(Command::Refresh));
+                self.preview_error = refresh.err().map(|error| {
+                    format!(
+                        "Preview started, but camera readbacks could not be refreshed: {error:#}"
+                    )
+                });
             }
+            Err(error) => self.preview_error = Some(format!("Preview: {error:#}")),
+        }
+    }
+
+    fn display_preview_frame(&mut self, ctx: &egui::Context, frame: PreviewFrame) {
+        self.frame_sequence = frame.sequence;
+        self.frame_captured_at = Some(frame.captured_at);
+        self.frame_dimensions = (frame.width, frame.height);
+        self.frame_fps = frame.fps;
+        let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
+        if let Some(texture) = &mut self.texture {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            self.texture =
+                Some(ctx.load_texture("yolocam-live", image, egui::TextureOptions::LINEAR));
         }
     }
 
@@ -764,8 +1002,19 @@ impl App {
                             .width(112.0)
                             .show_ui(ui, |ui| {
                                 for (number, label) in spec.options {
-                                    changed |=
-                                        ui.selectable_value(&mut value, *number, *label).changed();
+                                    let option_reason =
+                                        self.requested_control_reason(spec.key, *number);
+                                    let response = ui.add_enabled(
+                                        option_reason.is_none(),
+                                        egui::Button::selectable(value == *number, *label),
+                                    );
+                                    if response.clicked() {
+                                        changed |= value != *number;
+                                        value = *number;
+                                    }
+                                    if let Some(reason) = option_reason {
+                                        response.on_disabled_hover_text(reason);
+                                    }
                                 }
                             });
                     });
@@ -833,6 +1082,20 @@ impl App {
                     .color(MUTED),
             );
         }
+        if matches!(spec.key, "hdr" | "frame-rate") {
+            let requested = if spec.key == "hdr" { 1 } else { value };
+            if let Some(reason) = self.requested_control_reason(spec.key, requested) {
+                ui.label(RichText::new(reason).size(10.0).color(AMBER));
+            } else if spec.key == "hdr"
+                && let Some(advisory) = crate::compatibility::hdr_fps_check(
+                    Some(1),
+                    crate::compatibility::camera_fps(&self.state),
+                )
+                .advisory
+            {
+                ui.label(RichText::new(advisory).size(10.0).color(MUTED));
+            }
+        }
         if let Some(actual) = actual.filter(|value| *value < spec.min || *value > maximum) {
             let (reported, minimum, maximum) = if spec.key == "exposure-ev" {
                 (exposure_display(actual), -8, 8)
@@ -849,6 +1112,7 @@ impl App {
         }
         ui.add_space(8.0);
         if changed
+            && self.requested_control_reason(spec.key, value).is_none()
             && self.send(Command::SetParam {
                 key: spec.key.to_owned(),
                 value,
@@ -1113,7 +1377,7 @@ impl App {
                 };
                 if ui
                     .add_enabled(
-                        !self.installing && !self.uncertain_update,
+                        !self.busy && !self.installing && !self.uncertain_update,
                         egui::Button::new(label),
                     )
                     .on_hover_text(
@@ -1125,37 +1389,46 @@ impl App {
                 }
             });
         });
+        self.preview_mode_controls(ui);
         ui.add_space(10.0);
         let width = ui.available_width();
-        let height = (width * 9.0 / 16.0).min((ui.available_height() - 190.0).max(180.0));
+        let height = (width * 9.0 / 16.0).min((ui.available_height() - 245.0).max(150.0));
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, Color32::from_rgb(11, 13, 14));
+        let mut image_rect = None;
         if self.settings.preview_enabled && self.demo {
-            draw_demo_pattern(&painter, rect);
+            let image = letterboxed_image_rect(
+                rect,
+                (
+                    self.settings.preview_mode.width as usize,
+                    self.settings.preview_mode.height as usize,
+                ),
+            );
+            draw_demo_pattern(&painter, image);
+            image_rect = Some(image);
         } else if self.settings.preview_enabled
             && let Some(texture) = &self.texture
         {
-            let aspect = self.frame_dimensions.0 as f32 / self.frame_dimensions.1.max(1) as f32;
-            let size = if rect.width() / rect.height() > aspect {
-                Vec2::new(rect.height() * aspect, rect.height())
-            } else {
-                Vec2::new(rect.width(), rect.width() / aspect)
-            };
-            let image_rect = egui::Rect::from_center_size(rect.center(), size);
+            let image = letterboxed_image_rect(rect, self.frame_dimensions);
             painter.image(
                 texture.id(),
-                image_rect,
+                image,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
+            image_rect = Some(image);
         } else {
             let message = if self.installing {
                 "PREVIEW RELEASED FOR FIRMWARE UPDATE"
             } else if self.uncertain_update {
                 "WAITING FOR CAMERA VERIFICATION"
-            } else if self.settings.preview_enabled && self.preview_attempted {
+            } else if self.settings.preview_enabled
+                && (self.preview_attempted || self.preview_error.is_some())
+            {
                 "PREVIEW UNAVAILABLE"
+            } else if self.settings.preview_enabled && self.preview_probe.is_some() {
+                "READING VIDEO MODES"
             } else if self.settings.preview_enabled {
                 "WAITING FOR CAMERA"
             } else {
@@ -1186,6 +1459,7 @@ impl App {
             Stroke::new(1.0_f32, LINE),
             egui::StrokeKind::Inside,
         );
+        self.focus_overlay(ui, &painter, image_rect);
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label(
@@ -1200,10 +1474,10 @@ impl App {
                 .size(10.0)
                 .color(AMBER),
             );
-            if self.preview.is_running() {
+            if self.preview.is_running() && self.frame_dimensions.0 > 0 {
                 ui.label(
                     RichText::new(format!(
-                        "{} × {} · {:.1} fps",
+                        "{} × {} · {:.1} fps delivered",
                         self.frame_dimensions.0, self.frame_dimensions.1, self.frame_fps
                     ))
                     .monospace()
@@ -1220,6 +1494,23 @@ impl App {
                 );
             });
         });
+        if let Some(reason) = self.preview_focus_reason() {
+            ui.label(RichText::new(reason).size(11.0).color(MUTED));
+            if self.connected
+                && !self.busy
+                && self.state.focus_target.is_none()
+                && matches!(self.state.values.get("focus-mode"), Some(1 | 3))
+                && ui.small_button("Refresh focus region").clicked()
+            {
+                self.send(Command::Refresh);
+            }
+        } else {
+            ui.label(
+                RichText::new("Click or drag the focus region. Release to apply.")
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        }
         if self.state.eptz.is_some() {
             self.crop_controls(ui);
         } else {
@@ -1230,6 +1521,212 @@ impl App {
                     .color(MUTED),
             );
         }
+    }
+
+    fn preview_mode_controls(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(9.0);
+        let selected = self.settings.preview_mode;
+        let capabilities = self.preview_capabilities.clone();
+        let selectable =
+            capabilities.is_some() && !self.busy && !self.installing && !self.uncertain_update;
+        let mut chosen = selected;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Preview mode").size(11.0).color(MUTED));
+            ui.add_enabled_ui(selectable, |ui| {
+                egui::ComboBox::from_id_salt("preview-mode")
+                    .selected_text(selected.label())
+                    .width(215.0)
+                    .show_ui(ui, |ui| {
+                        if let Some(capabilities) = &capabilities {
+                            for mode in &capabilities.modes {
+                                let reason = self.preview_choice_reason(Some(capabilities), *mode);
+                                let response = ui.add_enabled(
+                                    reason.is_none(),
+                                    egui::Button::selectable(*mode == selected, mode.label()),
+                                );
+                                if response.clicked() {
+                                    chosen = *mode;
+                                }
+                                if let Some(reason) = reason {
+                                    response.on_disabled_hover_text(reason);
+                                }
+                            }
+                        }
+                    });
+            });
+            if ui
+                .add_enabled(
+                    !self.demo
+                        && !self.busy
+                        && !self.installing
+                        && !self.uncertain_update
+                        && self.preview_probe.is_none(),
+                    egui::Button::new("Refresh modes").small(),
+                )
+                .clicked()
+            {
+                self.refresh_preview_modes();
+            }
+        });
+        if chosen != selected {
+            self.select_preview_mode(chosen);
+        }
+        let reason = self.preview_error.clone().or_else(|| {
+            self.preview_choice_reason(
+                self.preview_capabilities.as_ref(),
+                self.settings.preview_mode,
+            )
+        });
+        if let Some(reason) = reason {
+            ui.label(RichText::new(reason).size(11.0).color(AMBER));
+            if self.settings.preview_enabled
+                && self.preview_error.is_some()
+                && ui
+                    .add_enabled(
+                        selectable
+                            && self
+                                .preview_choice_reason(capabilities.as_ref(), chosen)
+                                .is_none(),
+                        egui::Button::new("Retry preview").small(),
+                    )
+                    .clicked()
+            {
+                self.preview_attempted = false;
+                self.preview_error = None;
+                self.frame_sequence = 0;
+            }
+        } else if self.preview_probe.is_some() {
+            ui.label(
+                RichText::new("Reading capture modes from the USB video device…")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        } else if let Some(mode) = self.preview.active_mode() {
+            ui.label(
+                RichText::new(format!("Negotiated {} · MJPEG", mode.label()))
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        } else {
+            ui.label(
+                RichText::new("MJPEG USB capture · Starting capture may update camera frame rate.")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        }
+        if let Some(capabilities) = capabilities
+            && !capabilities.warnings.is_empty()
+        {
+            ui.label(
+                RichText::new("Video mode enumeration notes")
+                    .size(10.0)
+                    .color(AMBER),
+            )
+            .on_hover_text(capabilities.warnings.join("\n"));
+        }
+    }
+
+    fn preview_focus_reason(&self) -> Option<String> {
+        if self.busy || self.installing || self.uncertain_update {
+            return Some("Focus positioning is paused during the firmware operation".to_owned());
+        }
+        if !self.connected {
+            return Some("Connect the camera to position focus".to_owned());
+        }
+        if self.focus_pending
+            || ["focus-mode", "focus-level"]
+                .iter()
+                .any(|key| self.desired.contains_key(*key))
+            || self.desired_crop.is_some()
+        {
+            return Some("Waiting for the camera to confirm focus or framing changes".to_owned());
+        }
+        if let Some(reason) = focus::control_reason(&self.state) {
+            return Some(reason);
+        }
+        if !self.settings.preview_enabled {
+            return Some("Start preview to position focus".to_owned());
+        }
+        let fresh = self.demo
+            || (self.preview.is_running()
+                && self
+                    .frame_captured_at
+                    .is_some_and(|received| received.elapsed() <= Duration::from_secs(2)));
+        (!fresh).then(|| "Focus positioning requires a fresh live preview".to_owned())
+    }
+
+    fn focus_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        image_rect: Option<egui::Rect>,
+    ) {
+        let interactive = self.preview_focus_reason().is_none();
+        if !interactive {
+            self.focus_draft = None;
+            self.focus_drag_armed = false;
+        }
+        let (Some(image_rect), Some(actual)) = (image_rect, self.state.focus_target) else {
+            return;
+        };
+        if focus::control_reason(&self.state).is_some() {
+            return;
+        }
+        if interactive {
+            let response = ui
+                .interact(
+                    image_rect,
+                    ui.id().with("focus-overlay"),
+                    egui::Sense::click_and_drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::Crosshair);
+            if response.drag_started() {
+                self.focus_drag_armed = response
+                    .ctx
+                    .input(|input| input.pointer.press_origin())
+                    .is_some_and(|origin| image_rect.contains(origin));
+            }
+            if response.dragged() && self.focus_drag_armed {
+                self.focus_draft = response
+                    .interact_pointer_pos()
+                    .and_then(|position| focus_target_at(actual, image_rect, position));
+            }
+            let commit = response.clicked() || (response.drag_stopped() && self.focus_drag_armed);
+            if commit {
+                let target = response
+                    .interact_pointer_pos()
+                    .and_then(|position| focus_target_at(actual, image_rect, position));
+                self.focus_draft = None;
+                self.focus_drag_armed = false;
+                if let Some(target) = target
+                    && self.send(Command::SetFocusTarget(target))
+                {
+                    self.focus_pending = !self.demo;
+                }
+            }
+        }
+        let target = self
+            .focus_draft
+            .or(self.state.focus_target)
+            .unwrap_or(actual);
+        let target_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                image_rect.left() + target.left * image_rect.width(),
+                image_rect.top() + target.top * image_rect.height(),
+            ),
+            egui::pos2(
+                image_rect.left() + target.right * image_rect.width(),
+                image_rect.top() + target.bottom * image_rect.height(),
+            ),
+        );
+        let colour = if interactive { AMBER } else { MUTED };
+        painter.rect_stroke(
+            target_rect,
+            1.0,
+            Stroke::new(1.6_f32, colour),
+            egui::StrokeKind::Inside,
+        );
+        painter.circle_stroke(target_rect.center(), 3.0, Stroke::new(1.2_f32, colour));
     }
 
     fn crop_controls(&mut self, ui: &mut egui::Ui) {
@@ -1557,6 +2054,7 @@ impl App {
             );
         }
         for preset in self.presets.clone() {
+            let compatibility_reason = self.preset_reason(&preset);
             ui.horizontal(|ui| {
                 let selected = self.selected_preset.as_deref() == Some(&preset.name);
                 if ui
@@ -1574,15 +2072,26 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(
-                            self.connected && !self.busy && !self.demo,
+                            self.connected
+                                && !self.busy
+                                && !self.demo
+                                && compatibility_reason.is_none(),
                             egui::Button::new("Apply"),
                         )
+                        .on_disabled_hover_text(compatibility_reason.clone().unwrap_or_default())
                         .clicked()
                     {
                         self.send(Command::ApplyPreset(Box::new(preset.clone())));
                     }
                 });
             });
+            if let Some(reason) = compatibility_reason {
+                ui.label(RichText::new(reason).size(11.0).color(AMBER));
+            } else if let Ok(plan) = crate::compatibility::preset_plan(&self.state, &preset) {
+                for advisory in plan.advisories {
+                    ui.label(RichText::new(advisory).size(11.0).color(MUTED));
+                }
+            }
             if let Some(note) = preset.omission_note() {
                 let details = preset
                     .omitted_controls
@@ -1874,7 +2383,13 @@ impl eframe::App for App {
             });
         self.firmware_confirmation(ctx);
         ctx.request_repaint_after(if self.preview.is_running() || self.demo {
-            Duration::from_millis(33)
+            let fps = self
+                .preview
+                .active_mode()
+                .unwrap_or(self.settings.preview_mode)
+                .fps()
+                .clamp(1.0, 60.0);
+            Duration::from_secs_f64(1.0 / fps)
         } else {
             Duration::from_millis(200)
         });
@@ -1978,6 +2493,69 @@ fn control_reason(state: &CameraState, key: &str, connected: bool, busy: bool) -
             Some("Enable the colour LUT to adjust its intensity".to_owned())
         }
         _ => None,
+    }
+}
+
+fn preview_mode_reason(
+    state: &CameraState,
+    capabilities: Option<&PreviewCapabilities>,
+    mode: PreviewMode,
+) -> Option<String> {
+    if let Some(reason) = mode.restriction_reason() {
+        return Some(reason);
+    }
+    if capabilities.is_some_and(|capabilities| !capabilities.supports(mode)) {
+        return Some(format!(
+            "Saved preview mode {} is unavailable on this video device. Choose an advertised mode; your saved choice has been kept.",
+            mode.label()
+        ));
+    }
+    crate::compatibility::preview_reason(state, mode.fps())
+}
+
+fn letterboxed_image_rect(bounds: egui::Rect, dimensions: (usize, usize)) -> egui::Rect {
+    let aspect = dimensions.0.max(1) as f32 / dimensions.1.max(1) as f32;
+    let size = if bounds.width() / bounds.height() > aspect {
+        Vec2::new(bounds.height() * aspect, bounds.height())
+    } else {
+        Vec2::new(bounds.width(), bounds.width() / aspect)
+    };
+    egui::Rect::from_center_size(bounds.center(), size)
+}
+
+fn focus_target_at(
+    target: FocusTarget,
+    image: egui::Rect,
+    point: egui::Pos2,
+) -> Option<FocusTarget> {
+    if !image.contains(point) || image.width() <= 0.0 || image.height() <= 0.0 {
+        return None;
+    }
+    target
+        .moved_to(
+            (point.x - image.left()) / image.width(),
+            (point.y - image.top()) / image.height(),
+        )
+        .ok()
+}
+
+fn demo_preview_capabilities() -> PreviewCapabilities {
+    PreviewCapabilities {
+        device: PathBuf::from("/dev/v4l/by-id/usb-YoloCam_S3_DEMO-video-index0"),
+        modes: [
+            (1280, 720, 30),
+            (1280, 720, 60),
+            (1920, 1080, 30),
+            (1920, 1080, 60),
+            (3840, 2160, 30),
+        ]
+        .map(|(width, height, fps)| PreviewMode {
+            width,
+            height,
+            interval: (1, fps),
+        })
+        .to_vec(),
+        warnings: Vec::new(),
     }
 }
 
@@ -2117,6 +2695,7 @@ fn demo_state() -> CameraState {
     state.hsl = Some(HslState::default());
     state.profile = Some(crate::pb::TuningParam::default());
     state.wb_offsets = Some((10, 10));
+    state.focus_target = Some(FocusTarget::new(0.3, 0.23, 0.7, 0.77).unwrap());
     state
 }
 
@@ -2186,6 +2765,410 @@ fn draw_demo_pattern(painter: &egui::Painter, rect: egui::Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_app() -> App {
+        let temp = tempfile::tempdir().unwrap();
+        App::new(
+            Store::at(temp.path().to_owned()).unwrap(),
+            Settings::default(),
+            None,
+            12345,
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn successful_preview_negotiation_refreshes_once_without_guessing_fps_or_losing_edits() {
+        let mut app = sample_app();
+        let (worker, commands, events) = Worker::test_channel();
+        app.worker = Some(worker);
+        app.demo = false;
+        app.desired.insert("contrast".to_owned(), 71);
+        app.desired_hsl.insert((0, 3), 20);
+        app.desired_crop = Some(Crop::centred(1.5).unwrap());
+        app.desired_wb = Some((11, 8));
+        let desired = app.desired.clone();
+        let desired_hsl = app.desired_hsl.clone();
+        let desired_crop = app.desired_crop.clone();
+        let desired_wb = app.desired_wb;
+        let original_fps = app.state.values.get("frame-rate").copied();
+
+        // The same completion handler follows a real successful start_mode.
+        app.handle_preview_start(Ok(()));
+        assert!(app.preview_attempted);
+        assert!(app.preview_error.is_none());
+        let queued = commands.try_iter().collect::<Vec<_>>();
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(queued[0], Command::Refresh));
+        assert_eq!(
+            app.state.values.get("frame-rate").copied(),
+            original_fps,
+            "The negotiated preview rate must not become a guessed camera readback"
+        );
+        assert_eq!(app.desired, desired);
+        assert_eq!(app.desired_hsl, desired_hsl);
+        assert_eq!(app.desired_crop, desired_crop);
+        assert_eq!(app.desired_wb, desired_wb);
+
+        // Repaints after this attempt perform no capture/refresh or SET5.
+        for _ in 0..3 {
+            app.update_preview(&egui::Context::default());
+        }
+        assert!(commands.try_recv().is_err());
+
+        // Only a serialized camera State event updates controlling readbacks.
+        let mut readback = app.state.clone();
+        readback.values.insert("frame-rate".to_owned(), 30);
+        let focus = FocusTarget::new(0.2, 0.2, 0.6, 0.74).unwrap();
+        readback.focus_target = Some(focus);
+        events.send(Event::State(Box::new(readback))).unwrap();
+        app.poll_worker();
+        assert_eq!(app.state.values.get("frame-rate"), Some(&30));
+        assert_eq!(app.state.focus_target, Some(focus));
+        assert_eq!(app.desired, desired);
+        assert_eq!(app.desired_hsl, desired_hsl);
+        assert_eq!(app.desired_crop, desired_crop);
+        assert_eq!(app.desired_wb, desired_wb);
+
+        app.handle_preview_start(Err(anyhow::anyhow!("Capture negotiation failed")));
+        assert!(
+            commands.try_recv().is_err(),
+            "Failed starts must not refresh"
+        );
+        assert!(
+            app.preview_error
+                .as_ref()
+                .unwrap()
+                .contains("Capture negotiation failed")
+        );
+        app.update_preview(&egui::Context::default());
+        assert!(commands.try_recv().is_err());
+        app.handle_preview_start(Ok(()));
+        let restarted = commands.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            restarted.len(),
+            1,
+            "A new successful start requires one new refresh"
+        );
+        assert!(matches!(restarted[0], Command::Refresh));
+    }
+
+    #[test]
+    fn post_preview_refresh_queue_failure_is_visible_and_preserves_pending_edits() {
+        let mut app = sample_app();
+        let (worker, commands, _events) = Worker::test_channel();
+        app.worker = Some(worker);
+        drop(commands);
+        app.desired.insert("contrast".to_owned(), 71);
+        app.handle_preview_start(Ok(()));
+        assert!(
+            app.preview_error
+                .as_ref()
+                .unwrap()
+                .contains("camera readbacks could not be refreshed")
+        );
+        assert_eq!(app.desired.get("contrast"), Some(&71));
+        assert!(
+            app.preview_attempted,
+            "No automatic refresh/write retry on every repaint"
+        );
+    }
+
+    #[test]
+    fn preview_modes_require_advertised_support_and_confirmed_sdr_above_thirty() {
+        let mut state = demo_state();
+        let capabilities = demo_preview_capabilities();
+        let high = PreviewMode {
+            interval: (1, 60),
+            ..PreviewMode::default()
+        };
+        assert!(preview_mode_reason(&state, Some(&capabilities), high).is_none());
+        state.values.insert("hdr".to_owned(), 1);
+        assert!(
+            preview_mode_reason(&state, Some(&capabilities), high)
+                .unwrap()
+                .contains("HDR")
+        );
+        assert!(preview_mode_reason(&state, Some(&capabilities), PreviewMode::default()).is_none());
+        state.values.remove("hdr");
+        assert!(
+            preview_mode_reason(&state, Some(&capabilities), high)
+                .unwrap()
+                .contains("unavailable")
+        );
+        let unavailable = PreviewMode {
+            interval: (1, 50),
+            ..PreviewMode::default()
+        };
+        assert!(
+            preview_mode_reason(&state, Some(&capabilities), unavailable)
+                .unwrap()
+                .contains("saved choice has been kept")
+        );
+        let four_k = PreviewMode {
+            width: 3840,
+            height: 2160,
+            interval: (1, 60),
+        };
+        assert!(
+            preview_mode_reason(&state, Some(&capabilities), four_k)
+                .unwrap()
+                .contains("4K")
+        );
+    }
+
+    #[test]
+    fn selected_preview_rate_guards_hdr_controls_and_presets_without_camera_rate_writes() {
+        let mut app = sample_app();
+        let before = app.state.values.clone();
+        let high = PreviewMode {
+            interval: (1, 60),
+            ..PreviewMode::default()
+        };
+        app.select_preview_mode(high);
+        assert_eq!(app.settings.preview_mode, high);
+        assert_eq!(
+            app.state.values, before,
+            "Preview selection must not change camera-side controls"
+        );
+        assert!(
+            app.requested_control_reason("hdr", 1)
+                .unwrap()
+                .contains("preview mode at 30 fps")
+        );
+        assert!(
+            app.requested_control_reason("hdr", 0).is_none(),
+            "Turning HDR off must remain available"
+        );
+        assert!(!app.send(Command::SetParam {
+            key: "hdr".to_owned(),
+            value: 1
+        }));
+        assert_eq!(app.state.values.get("hdr"), Some(&0));
+        let mut preset = Preset::capture("HDR look", &app.state).unwrap();
+        preset.values = BTreeMap::from([("hdr".to_owned(), 1)]);
+        preset.profile = None;
+        assert!(app.preset_reason(&preset).unwrap().contains("HDR preset"));
+        assert!(!app.send(Command::ApplyPreset(Box::new(preset))));
+        assert_eq!(app.state.values, before);
+        app.select_preview_mode(PreviewMode::default());
+        assert!(app.requested_control_reason("hdr", 1).is_none());
+        app.settings.preview_mode = PreviewMode {
+            interval: (333_333, 10_000_000),
+            ..PreviewMode::default()
+        };
+        assert!(
+            app.requested_control_reason("hdr", 1).is_none(),
+            "Nominal 30 fps interval quantization must not block HDR"
+        );
+        app.desired.insert("hdr".to_owned(), 1);
+        assert!(
+            app.preview_choice_reason(app.preview_capabilities.as_ref(), high)
+                .unwrap()
+                .contains("pending HDR")
+        );
+        let mut confirmed = app.state.clone();
+        confirmed.values.insert("hdr".to_owned(), 1);
+        app.handle_worker_event(Event::State(Box::new(confirmed)));
+        assert!(!app.desired.contains_key("hdr"));
+        assert!(
+            app.preview_choice_reason(app.preview_capabilities.as_ref(), high)
+                .unwrap()
+                .contains("HDR requires")
+        );
+    }
+
+    #[test]
+    fn unavailable_saved_mode_stays_visible_without_fallback_or_control_changes() {
+        let mut app = sample_app();
+        let saved = PreviewMode {
+            width: 2560,
+            height: 1440,
+            interval: (1, 30),
+        };
+        app.settings.preview_mode = saved;
+        let before = app.state.values.clone();
+        let context = egui::Context::default();
+        configure_theme(&context);
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| app.preview_mode_controls(ui));
+        });
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.iter().any(|text| text.contains("2560 × 1440")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|text| text.contains("unavailable on this video device")),
+            "{text:?}"
+        );
+        assert_eq!(app.settings.preview_mode, saved);
+        assert_eq!(app.state.values, before);
+        assert!(app.desired.is_empty());
+    }
+
+    #[test]
+    fn focus_coordinates_ignore_letterboxing_and_preserve_confirmed_target_size() {
+        let bounds = egui::Rect::from_min_size(egui::pos2(100.0, 80.0), Vec2::new(600.0, 600.0));
+        let image = letterboxed_image_rect(bounds, (1920, 1080));
+        let target = FocusTarget::new(0.3, 0.23, 0.7, 0.77).unwrap();
+        assert!(focus_target_at(target, image, bounds.left_top()).is_none());
+        let centered = focus_target_at(target, image, image.center()).unwrap();
+        assert!(centered.approximately_equal(&target));
+        let edge = focus_target_at(target, image, image.right_bottom()).unwrap();
+        assert!((edge.width() - target.width()).abs() < 0.00001);
+        assert!((edge.height() - target.height()).abs() < 0.00001);
+        assert_eq!((edge.right, edge.bottom), (1.0, 1.0));
+    }
+
+    #[test]
+    fn copying_a_stalled_mailbox_frame_does_not_make_its_focus_coordinates_fresh() {
+        let mut app = sample_app();
+        app.state.values.insert("focus-mode".to_owned(), 1);
+        app.demo = false;
+        let captured_at = Instant::now() - Duration::from_secs(3);
+        app.display_preview_frame(
+            &egui::Context::default(),
+            PreviewFrame {
+                width: 1,
+                height: 1,
+                rgb: vec![255, 255, 255],
+                sequence: 1,
+                fps: 30.0,
+                captured_at,
+            },
+        );
+        assert_eq!(app.frame_captured_at, Some(captured_at));
+        assert!(app.frame_captured_at.unwrap().elapsed() > Duration::from_secs(2));
+        assert!(app.preview_focus_reason().unwrap().contains("fresh live"));
+    }
+
+    #[test]
+    fn disconnected_focus_geometry_is_cleared_and_requires_new_connected_readback() {
+        let mut app = sample_app();
+        let original = app.state.focus_target;
+        assert!(original.is_some());
+        app.focus_pending = true;
+        app.focus_draft = original;
+        app.handle_worker_event(Event::Connection(false));
+        assert!(app.state.focus_target.is_none());
+        assert!(app.focus_draft.is_none());
+        assert!(!app.focus_pending);
+        app.handle_worker_event(Event::State(Box::new(demo_state())));
+        assert!(
+            app.state.focus_target.is_none(),
+            "Disconnected cached State events must not restore old geometry"
+        );
+        app.handle_worker_event(Event::Connection(true));
+        assert!(
+            app.state.focus_target.is_none(),
+            "A recovered socket alone is not a new focus readback"
+        );
+        app.handle_worker_event(Event::State(Box::new(demo_state())));
+        assert_eq!(app.state.focus_target, original);
+    }
+
+    #[test]
+    fn focus_gesture_waits_until_release_and_disabled_states_cancel_drafts() {
+        let mut app = sample_app();
+        app.state.values.insert("focus-mode".to_owned(), 1);
+        let original = app.state.focus_target.unwrap();
+        let context = egui::Context::default();
+        let image = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), Vec2::new(640.0, 360.0));
+        let render = |app: &mut App, events| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let painter = ui.painter().clone();
+                        app.focus_overlay(ui, &painter, Some(image));
+                    });
+                },
+            );
+        };
+        render(&mut app, vec![]);
+        let pressed = egui::pos2(320.0, 250.0);
+        render(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pressed),
+                egui::Event::PointerButton {
+                    pos: pressed,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let moved = egui::pos2(550.0, 280.0);
+        render(&mut app, vec![egui::Event::PointerMoved(moved)]);
+        assert_eq!(
+            app.state.focus_target,
+            Some(original),
+            "Dragging must not write the camera"
+        );
+        assert!(app.focus_draft.is_some());
+        render(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: moved,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            app.state.focus_target,
+            focus_target_at(original, image, moved)
+        );
+        assert!(app.focus_draft.is_none());
+        let confirmed = app.state.focus_target;
+        app.focus_draft = Some(original);
+        app.settings.preview_enabled = false;
+        render(&mut app, vec![]);
+        assert!(app.focus_draft.is_none());
+        assert_eq!(app.state.focus_target, confirmed);
+        assert!(
+            app.preview_focus_reason()
+                .unwrap()
+                .contains("Start preview")
+        );
+        app.settings.preview_enabled = true;
+        app.desired.insert("focus-level".to_owned(), 2);
+        assert!(app.preview_focus_reason().unwrap().contains("Waiting"));
+        app.desired.clear();
+        app.busy = true;
+        assert!(app.preview_focus_reason().unwrap().contains("firmware"));
+        app.busy = false;
+        app.demo = false;
+        app.frame_captured_at = Some(Instant::now() - Duration::from_secs(3));
+        assert!(app.preview_focus_reason().unwrap().contains("fresh live"));
+        app.handle_worker_event(Event::Status {
+            message: "Focus acknowledgement was lost; command was not replayed".to_owned(),
+            error: true,
+        });
+        assert_eq!(
+            app.state.focus_target, confirmed,
+            "A rejected action must not invent a new confirmed target"
+        );
+        assert!(!app.focus_pending);
+    }
 
     #[test]
     fn control_connection_error_survives_reconnect_progress_and_clears_after_recovery() {

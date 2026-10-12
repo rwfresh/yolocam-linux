@@ -12,6 +12,7 @@ use std::{
 };
 
 use crate::camera::{CameraState, Crop, HslState, param_specs, unsupported_control_reason};
+use crate::preview::PreviewMode;
 
 pub const APP_DIRECTORY: &str = "yolocam-linux";
 
@@ -22,6 +23,7 @@ pub struct Settings {
     pub preview_enabled: bool,
     pub active_tab: String,
     pub preview_device: Option<PathBuf>,
+    pub preview_mode: PreviewMode,
 }
 
 impl Default for Settings {
@@ -31,6 +33,7 @@ impl Default for Settings {
             preview_enabled: false,
             active_tab: "camera".to_owned(),
             preview_device: None,
+            preview_mode: PreviewMode::default(),
         }
     }
 }
@@ -368,6 +371,32 @@ pub fn save_update_backup(state: &CameraState) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_settings_keep_default_preview_and_fractional_modes_round_trip() {
+        let old: Settings = serde_json::from_slice(
+            br#"{"schema_version":1,"preview_enabled":true,"active_tab":"colour"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.preview_mode, PreviewMode::default());
+        assert!(old.preview_enabled);
+        assert_eq!(old.active_tab, "colour");
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().to_owned()).unwrap();
+        let settings = Settings {
+            preview_mode: PreviewMode {
+                width: 1920,
+                height: 1080,
+                interval: (1001, 30000),
+            },
+            ..old
+        };
+        store.save_settings(&settings).unwrap();
+        assert_eq!(
+            store.load_settings().unwrap().preview_mode,
+            settings.preview_mode
+        );
+    }
 
     #[test]
     fn preset_names_cannot_escape_directory_or_collide() {
