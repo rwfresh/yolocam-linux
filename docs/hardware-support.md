@@ -17,7 +17,7 @@ been tested, and its firmware updater accepts only the S3 `ch131b` model.
 | Colour profiles | Commands 50/53 | IDs/styles, independent SDR/HDR profile banks |
 | Manual focus readback | Command 111 | Manual mode is required for lens positioning |
 | LUT grading | Commands 94–96 | 5,508 packed 30-bit entries, no byte-RGB substitution |
-| Firmware updates | Commands 2/3/28 | Verified package upload, final-packet commit, reboot verification |
+| Firmware updates | Commands 2/3/28 | Official package validation; upload/commit/reboot tested with simulated cameras, physical Rust flashing unvalidated |
 
 S3 firmware 1.0.4 acknowledges the legacy brightness command (7) without changing
 the image, and its getter does not supply a meaningful current value. The app

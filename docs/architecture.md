@@ -30,8 +30,9 @@ cannot become active when a new preview starts. No image files are written.
 and reboot verification. The package is checked again from the exact in-memory
 bytes to close the gap between verification and upload. Packet responses must
 acknowledge the expected total/current indices. Failure before commit aborts;
-failure after the final packet becomes `UpdateUncertain` and leads to version
-verification, without another upload.
+transport or acknowledgement failure after the final packet becomes
+`UpdateUncertain` and leads to version verification, without another upload.
+An explicit camera failure remains `CameraUpdateFailed`.
 
 `settings` stores preferences, presets and update backups outside the source
 tree. `gui` renders the native egui desktop app; it does no socket I/O. The

@@ -8,6 +8,10 @@ This is an independent community project, derived from Seth Hillbrand's
 [YoloCam Linux tools](https://gitlab.com/yolocam-linux/yolocam-linux) and
 licensed under **GPL-3.0-or-later**. See [NOTICE](NOTICE) for attribution.
 
+This is an **early community release**. Physical camera testing has used one S3
+on Ubuntu 24.04; other models and distributions have not been validated.
+See [release validation](docs/validation.md) for the tested controls and limits.
+
 ![YoloCam Linux native desktop interface in demo mode](docs/screenshot.png)
 
 ## Install
@@ -67,6 +71,10 @@ The built-in preview uses 720p at 30 fps; OBS and video calls negotiate their
 own capture format directly with the Linux driver.
 
 ## Firmware updater
+
+**Firmware flashing is experimental.** Official package validation and
+simulated transfer/reboot tests pass, but the Rust updater has **not yet flashed
+a physical camera**. See [firmware validation](docs/validation.md#firmware-package).
 
 The firmware page checks the manufacturer's S3 metadata, downloads the official
 package, verifies its model/version/build, archive layout, image size limits and
